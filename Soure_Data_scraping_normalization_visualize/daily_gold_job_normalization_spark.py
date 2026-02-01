@@ -31,6 +31,7 @@ from fuzzywuzzy import fuzz
 
 import re
 import unicodedata
+from decimal import Decimal
 
 # ====================== CONFIG ======================
 DB_USER = "CLOUD"
@@ -367,9 +368,42 @@ def normalize_locations(spark: SparkSession) -> Dict[int, int]:
     mapping = {}
     for grp in groups:
         ids = pandas_loc.iloc[grp]["ID"].tolist()
-        canon = min(ids)
+        # Convert Decimal/None to int, filter out None
+        ids_int = []
+        for id_val in ids:
+            if id_val is not None:
+                # Convert Decimal to int if needed
+                if isinstance(id_val, int):
+                    ids_int.append(id_val)
+                elif isinstance(id_val, float):
+                    ids_int.append(int(id_val))
+                elif isinstance(id_val, Decimal):
+                    ids_int.append(int(id_val))
+                else:
+                    # Handle other types (string, etc.)
+                    try:
+                        ids_int.append(int(float(str(id_val))))
+                    except (ValueError, TypeError):
+                        continue  # Skip invalid IDs
+        if not ids_int:
+            continue  # Skip group if no valid IDs
+        canon = min(ids_int)
         for idx in grp:
-            lid = int(pandas_loc.iloc[idx]["ID"])
+            lid_val = pandas_loc.iloc[idx]["ID"]
+            if lid_val is None:
+                continue
+            # Convert to int safely
+            try:
+                if isinstance(lid_val, int):
+                    lid = lid_val
+                elif isinstance(lid_val, float):
+                    lid = int(lid_val)
+                elif isinstance(lid_val, Decimal):
+                    lid = int(lid_val)
+                else:
+                    lid = int(float(str(lid_val)))
+            except (ValueError, TypeError):
+                continue  # Skip invalid ID
             if lid != canon:
                 mapping[lid] = canon
 
@@ -415,6 +449,20 @@ def normalize_locations(spark: SparkSession) -> Dict[int, int]:
         print("⚠️ Cảnh báo: Bảng CLEAN rỗng nhưng bảng gốc có dữ liệu! Copy toàn bộ dữ liệu gốc...")
         df_final = df_loc.select("ID", "CITY", "REGION")
         final_count = original_count
+
+    # Merge với CLEAN cũ (nếu có) để giữ nguyên dữ liệu đã clean
+    try:
+        df_clean_existing = read_table_from_oracle(spark, "LOCATION_DIMENSION_CLEAN", DB_USER)
+        existing_count = df_clean_existing.count()
+        if existing_count > 0:
+            print(f"📊 LOCATION_DIMENSION_CLEAN hiện có: {existing_count} records")
+            # Union và distinct để merge
+            df_final = df_clean_existing.unionByName(df_final, allowMissingColumns=True).distinct()
+            final_count = df_final.count()
+            print(f"📊 Sau merge: {final_count} records (giữ {existing_count} cũ, thêm {final_count - existing_count} mới)")
+    except Exception as e:
+        # Bảng CLEAN chưa có, giữ nguyên df_final
+        print(f"📊 LOCATION_DIMENSION_CLEAN chưa có, tạo mới: {final_count} records")
 
     # Ghi vào bảng _CLEAN (luôn có dữ liệu, kể cả không có gì để clean)
     write_table_to_oracle(df_final, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
@@ -499,6 +547,25 @@ def enrich_gold_types(spark: SparkSession) -> Tuple[int, int]:
         print("⚠️ Cảnh báo: Bảng CLEAN rỗng nhưng bảng gốc có dữ liệu! Copy toàn bộ dữ liệu gốc...")
         df_enriched = df
         enriched_count = original_count
+    
+    # Merge với CLEAN cũ (nếu có) để giữ nguyên dữ liệu đã clean
+    try:
+        df_clean_existing = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
+        existing_count = df_clean_existing.count()
+        if existing_count > 0:
+            print(f"📊 GOLD_TYPE_DIMENSION_CLEAN hiện có: {existing_count} records")
+            # Union và distinct để merge (giữ record mới nhất nếu trùng ID)
+            df_combined = df_clean_existing.unionByName(df_enriched, allowMissingColumns=True)
+            window_spec = Window.partitionBy("ID").orderBy(col("ID"))
+            df_enriched = df_combined.withColumn("rn", row_number().over(window_spec)) \
+                .filter(col("rn") == 1) \
+                .drop("rn") \
+                .distinct()
+            enriched_count = df_enriched.count()
+            print(f"📊 Sau merge: {enriched_count} records (giữ {existing_count} cũ)")
+    except Exception as e:
+        # Bảng CLEAN chưa có, giữ nguyên df_enriched
+        print(f"📊 GOLD_TYPE_DIMENSION_CLEAN chưa có, tạo mới: {enriched_count} records")
     
     # Ghi vào bảng _CLEAN (luôn có dữ liệu, kể cả không có gì để clean)
     write_table_to_oracle(df_enriched, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")

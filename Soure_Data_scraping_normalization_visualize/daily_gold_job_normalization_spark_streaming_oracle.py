@@ -361,7 +361,14 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
         print("📊 LOCATION_CLEAN chưa có, sẽ tạo mới")
     
     # Gọi normalize_locations (sẽ overwrite, nhưng ta sẽ merge lại sau)
-    location_mapping = normalize_locations(spark)
+    try:
+        location_mapping = normalize_locations(spark)
+    except Exception as e:
+        print(f"❌ Lỗi khi normalize_locations: {e}")
+        print(f"   Traceback: {type(e).__name__}: {str(e)}")
+        # Fallback: Không có mapping, chỉ dùng dữ liệu hiện có
+        location_mapping = {}
+        print("⚠️ Sử dụng location_mapping rỗng, giữ nguyên dữ liệu CLEAN hiện có")
     
     # Đọc CLEAN mới sau khi normalize
     try:
@@ -397,9 +404,14 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
         print("📊 TYPE_CLEAN chưa có, sẽ tạo mới")
     
     # Gọi các hàm enrich (sẽ overwrite, nhưng ta sẽ merge lại sau)
-    enrich_gold_types(spark)
-    normalize_purity_format(spark)
-    normalize_category_smart(spark)
+    try:
+        enrich_gold_types(spark)
+        normalize_purity_format(spark)
+        normalize_category_smart(spark)
+    except Exception as e:
+        print(f"❌ Lỗi khi enrich/normalize TYPE: {e}")
+        print(f"   Traceback: {type(e).__name__}: {str(e)}")
+        print("⚠️ Giữ nguyên dữ liệu TYPE_CLEAN hiện có")
     
     # Đọc CLEAN mới sau khi enrich
     try:
@@ -428,12 +440,23 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
     type_mapping = {}
     if merge_types:
         print("\n🔗 Bước 3: Merge duplicate types...")
-        type_mapping = merge_duplicate_types_and_update_fact(spark)
-        print(f"✅ Type mapping: {len(type_mapping)} mappings")
+        try:
+            type_mapping = merge_duplicate_types_and_update_fact(spark)
+            print(f"✅ Type mapping: {len(type_mapping)} mappings")
+        except Exception as e:
+            print(f"❌ Lỗi khi merge duplicate types: {e}")
+            print(f"   Traceback: {type(e).__name__}: {str(e)}")
+            type_mapping = {}
+            print("⚠️ Sử dụng type_mapping rỗng")
     else:
         print("\n⏭️  Bước 3: Bỏ qua merge types (dùng --merge-types để bật)")
     
-    normalize_gold_type_and_unit(spark)
+    try:
+        normalize_gold_type_and_unit(spark)
+    except Exception as e:
+        print(f"❌ Lỗi khi normalize_gold_type_and_unit: {e}")
+        print(f"   Traceback: {type(e).__name__}: {str(e)}")
+        print("⚠️ Bỏ qua bước normalize_gold_type_and_unit")
     
     print("\n✅ Đã clean tất cả dimension tables (giữ nguyên dữ liệu cũ)!")
     print("="*60 + "\n")
