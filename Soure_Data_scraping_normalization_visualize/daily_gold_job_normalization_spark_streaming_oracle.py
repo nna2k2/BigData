@@ -12,8 +12,11 @@ Giải pháp: Spark Structured Streaming + foreachBatch
 import argparse
 import datetime as dt
 import os
+import sys
 from typing import Dict, List, Tuple, Optional
 
+import pandas as pd
+import numpy as np
 from pyspark.sql import SparkSession
 from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.functions import (
@@ -27,6 +30,34 @@ from pyspark.sql.types import (
     TimestampType, DoubleType, LongType
 )
 from pyspark.sql.window import Window
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from fuzzywuzzy import fuzz
+
+import re
+import unicodedata
+
+# Import các hàm clean từ batch job
+# Thêm đường dẫn để import
+sys.path.insert(0, os.path.dirname(__file__))
+try:
+    from daily_gold_job_normalization_spark import (
+        normalize_locations,
+        enrich_gold_types,
+        normalize_purity_format,
+        normalize_category_smart,
+        normalize_gold_type_and_unit,
+        merge_duplicate_types_and_update_fact,
+        build_similarity_groups,
+        norm_txt,
+        snapshot_table
+    )
+    BATCH_FUNCTIONS_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Không thể import batch functions: {e}")
+    print("   Sẽ chỉ xử lý FACT, không clean LOCATION và TYPE")
+    BATCH_FUNCTIONS_AVAILABLE = False
 
 # ====================== CONFIG ======================
 DB_USER = "CLOUD"
@@ -43,6 +74,16 @@ JOB_NAME = "DAILY_GOLD_JOB_STREAMING_ORACLE"
 SIM_THRESHOLD_LOC = 0.80
 SIM_THRESHOLD_TYPE = 0.75
 FUZZY_FALLBACK = 90
+
+# Các constants cần thiết cho batch functions (nếu import được)
+try:
+    from daily_gold_job_normalization_spark import (
+        SIM_THRESHOLD_LOC as BATCH_SIM_THRESHOLD_LOC,
+        SIM_THRESHOLD_TYPE as BATCH_SIM_THRESHOLD_TYPE,
+        FUZZY_FALLBACK as BATCH_FUZZY_FALLBACK
+    )
+except:
+    pass
 
 # Streaming config
 STREAMING_CHECKPOINT_DIR = "./checkpoints/streaming_oracle"
@@ -290,12 +331,123 @@ def load_dimension_mappings(spark: SparkSession) -> Tuple[Dict, Dict]:
 
 # ==================== STREAMING WITH FOREACHBATCH ====================
 
+def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = False) -> Tuple[Dict, Dict]:
+    """
+    Clean tất cả dimension tables (LOCATION và TYPE) - INCREMENTAL.
+    Giữ nguyên dữ liệu CLEAN cũ, chỉ cập nhật/thêm mới.
+    Trả về mappings để dùng cho FACT.
+    """
+    if not BATCH_FUNCTIONS_AVAILABLE:
+        print("⚠️ Không thể clean dimensions, chỉ dùng mappings hiện có")
+        return {}, {}
+    
+    print("\n" + "="*60)
+    print("🧹 Đang clean tất cả dimension tables (INCREMENTAL)...")
+    print("="*60)
+    
+    # B1: LOCATION normalize -> LOCATION_DIMENSION_CLEAN
+    print("\n📍 Bước 1: Normalize LOCATION_DIMENSION...")
+    
+    # Đọc dữ liệu CLEAN hiện có TRƯỚC (để giữ lại)
+    try:
+        df_loc_clean_existing = read_table_from_oracle(spark, "LOCATION_DIMENSION_CLEAN", DB_USER)
+        existing_loc_count = df_loc_clean_existing.count()
+        existing_loc_ids = set([row["ID"] for row in df_loc_clean_existing.select("ID").collect()])
+        print(f"📊 LOCATION_CLEAN hiện có: {existing_loc_count} records")
+    except:
+        df_loc_clean_existing = None
+        existing_loc_ids = set()
+        existing_loc_count = 0
+        print("📊 LOCATION_CLEAN chưa có, sẽ tạo mới")
+    
+    # Gọi normalize_locations (sẽ overwrite, nhưng ta sẽ merge lại sau)
+    location_mapping = normalize_locations(spark)
+    
+    # Đọc CLEAN mới sau khi normalize
+    try:
+        df_loc_clean_new = read_table_from_oracle(spark, "LOCATION_DIMENSION_CLEAN", DB_USER)
+        new_loc_count = df_loc_clean_new.count()
+        
+        # Merge: Giữ nguyên CLEAN cũ + CLEAN mới (union và distinct)
+        if df_loc_clean_existing is not None and existing_loc_count > 0:
+            df_loc_clean_combined = df_loc_clean_existing.unionByName(df_loc_clean_new, allowMissingColumns=True)
+            df_loc_clean_final = df_loc_clean_combined.distinct()
+            final_count = df_loc_clean_final.count()
+            
+            write_table_to_oracle(df_loc_clean_final, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
+            print(f"✅ Đã cập nhật LOCATION_DIMENSION_CLEAN: {final_count} records (giữ {existing_loc_count} cũ)")
+        else:
+            print(f"✅ Đã tạo LOCATION_DIMENSION_CLEAN: {new_loc_count} records")
+    except Exception as e:
+        print(f"⚠️ Lỗi khi merge LOCATION_CLEAN: {e}")
+    
+    print(f"✅ Location mapping: {len(location_mapping)} mappings")
+    
+    # B2: GOLD TYPE enrich -> GOLD_TYPE_DIMENSION_CLEAN
+    print("\n💎 Bước 2: Enrich GOLD_TYPE_DIMENSION...")
+    
+    # Đọc dữ liệu CLEAN hiện có TRƯỚC (để giữ lại)
+    try:
+        df_type_clean_existing = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
+        existing_type_count = df_type_clean_existing.count()
+        print(f"📊 TYPE_CLEAN hiện có: {existing_type_count} records")
+    except:
+        df_type_clean_existing = None
+        existing_type_count = 0
+        print("📊 TYPE_CLEAN chưa có, sẽ tạo mới")
+    
+    # Gọi các hàm enrich (sẽ overwrite, nhưng ta sẽ merge lại sau)
+    enrich_gold_types(spark)
+    normalize_purity_format(spark)
+    normalize_category_smart(spark)
+    
+    # Đọc CLEAN mới sau khi enrich
+    try:
+        df_type_clean_new = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
+        new_type_count = df_type_clean_new.count()
+        
+        # Merge: Giữ nguyên CLEAN cũ + CLEAN mới (union và distinct)
+        if df_type_clean_existing is not None and existing_type_count > 0:
+            df_type_clean_combined = df_type_clean_existing.unionByName(df_type_clean_new, allowMissingColumns=True)
+            # Deduplicate theo ID (giữ record mới nhất nếu có trùng)
+            window_spec = Window.partitionBy("ID").orderBy(col("ID"))
+            df_type_clean_final = df_type_clean_combined.withColumn("rn", row_number().over(window_spec)) \
+                .filter(col("rn") == 1) \
+                .drop("rn") \
+                .distinct()
+            final_count = df_type_clean_final.count()
+            
+            write_table_to_oracle(df_type_clean_final, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+            print(f"✅ Đã cập nhật GOLD_TYPE_DIMENSION_CLEAN: {final_count} records (giữ {existing_type_count} cũ)")
+        else:
+            print(f"✅ Đã tạo GOLD_TYPE_DIMENSION_CLEAN: {new_type_count} records")
+    except Exception as e:
+        print(f"⚠️ Lỗi khi merge TYPE_CLEAN: {e}")
+    
+    # (Tuỳ chọn) gộp TYPE tương đồng
+    type_mapping = {}
+    if merge_types:
+        print("\n🔗 Bước 3: Merge duplicate types...")
+        type_mapping = merge_duplicate_types_and_update_fact(spark)
+        print(f"✅ Type mapping: {len(type_mapping)} mappings")
+    else:
+        print("\n⏭️  Bước 3: Bỏ qua merge types (dùng --merge-types để bật)")
+    
+    normalize_gold_type_and_unit(spark)
+    
+    print("\n✅ Đã clean tất cả dimension tables (giữ nguyên dữ liệu cũ)!")
+    print("="*60 + "\n")
+    
+    return location_mapping, type_mapping
+
 def process_batch(batch_id: int, batch_df: 'DataFrame', 
                  spark: SparkSession, table_name: str,
-                 location_mapping: Dict, type_mapping: Dict):
+                 clean_all: bool = False, merge_types: bool = False):
     """
     Xử lý mỗi batch trong streaming.
     Được gọi tự động bởi foreachBatch.
+    
+    Nếu clean_all=True, sẽ clean tất cả bảng (LOCATION, TYPE, FACT) mỗi khi FACT thay đổi.
     """
     print(f"\n{'='*60}")
     print(f"📦 Batch {batch_id} - {dt.datetime.now()}")
@@ -312,39 +464,135 @@ def process_batch(batch_id: int, batch_df: 'DataFrame',
         print("ℹ️ Không có dữ liệu mới trong batch này")
         return
     
-    print(f"📊 Số lượng records mới: {df_new.count()}")
+    print(f"📊 Số lượng records FACT mới: {df_new.count()}")
     
-    # Xử lý dữ liệu mới
+    # Nếu clean_all=True, clean tất cả dimension tables trước
+    location_mapping = {}
+    type_mapping = {}
+    
+    if clean_all:
+        print("\n🔄 Phát hiện FACT thay đổi, đang clean TẤT CẢ các bảng...")
+        print("   (Giữ nguyên dữ liệu CLEAN cũ, chỉ cập nhật/thêm mới)")
+        location_mapping, type_mapping = clean_all_dimensions_incremental(spark, merge_types)
+    else:
+        # Chỉ load mappings hiện có
+        location_mapping, type_mapping = load_dimension_mappings(spark)
+        print(f"📊 Sử dụng mappings hiện có: Location={len(location_mapping)}, Type={len(type_mapping)}")
+    
+    # Xử lý dữ liệu FACT mới với mappings
     df_processed = process_new_fact_data(spark, df_new, location_mapping, type_mapping)
     
     if df_processed.count() == 0:
         print("⚠️ Sau xử lý không còn dữ liệu")
         return
     
-    # Merge với dữ liệu CLEAN hiện có (để dedup toàn bộ)
+    # Merge với dữ liệu CLEAN hiện có (CHỈ THÊM, KHÔNG XÓA DỮ LIỆU CŨ) - Logic giống batch file
     try:
+        # Đọc bảng CLEAN hiện có
         df_existing = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
-        df_combined = df_existing.unionByName(df_processed, allowMissingColumns=True)
+        existing_count = df_existing.count()
+        print(f"📊 GOLD_PRICE_FACT_CLEAN hiện có: {existing_count} records")
         
-        # Deduplicate toàn bộ
+        # Union dữ liệu mới với dữ liệu cũ
+        df_combined = df_existing.unionByName(df_processed, allowMissingColumns=True)
+        combined_count = df_combined.count()
+        processed_count = df_processed.count()
+        print(f"📊 Sau merge: {combined_count} records (cũ: {existing_count}, mới: {processed_count})")
+        
+        # Apply cleaning trên dữ liệu đã merge (dedup, handle missing, flag outliers)
+        # Logic giống hệt batch file để đảm bảo consistency
+        print("🧹 Đang xử lý cleaning trên dữ liệu đã merge...")
+        
+        # 1. Dedup trên toàn bộ dữ liệu đã merge
+        df_combined = df_combined.cache()
+        before_dedup = df_combined.count()
+        
+        # Tạo composite key để dedup (với RECORDED_AT_SAFE để handle null)
         df_combined = df_combined.withColumn(
             "COMBO",
-            concat_ws("|",
+            concat_ws("|", 
                 col("SOURCE_ID").cast("string"),
                 col("TYPE_ID").cast("string"),
                 col("LOCATION_ID").cast("string"),
                 col("TIME_ID").cast("string")
             )
+        ).withColumn(
+            "RECORDED_AT_SAFE",
+            coalesce(col(TIMESTAMP_COLUMN), to_timestamp(lit("2000-01-01 00:00:00")))
         )
         
-        window_spec = Window.partitionBy("COMBO").orderBy(col(TIMESTAMP_COLUMN).desc())
-        df_final = df_combined.withColumn("rn", row_number().over(window_spec)) \
+        window_spec = Window.partitionBy("COMBO").orderBy(col("RECORDED_AT_SAFE").desc())
+        df_combined = df_combined.withColumn("rn", row_number().over(window_spec)) \
             .filter(col("rn") == 1) \
-            .drop("rn", "COMBO")
+            .drop("rn", "COMBO", "RECORDED_AT_SAFE")
         
-        # Ghi lại bảng CLEAN
-        write_table_to_oracle(df_final, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
-        print(f"✅ Đã cập nhật GOLD_PRICE_FACT_CLEAN: {df_final.count()} records")
+        after_dedup = df_combined.count()
+        n_dup = before_dedup - after_dedup
+        print(f"   ✅ Đã loại bỏ {n_dup} bản ghi trùng")
+        
+        # 2. Handle missing values (chỉ loại bỏ record thiếu critical fields)
+        before_missing = df_combined.count()
+        df_combined = df_combined.filter(
+            col("BUY_PRICE").isNotNull() & 
+            col("SELL_PRICE").isNotNull() & 
+            col(TIMESTAMP_COLUMN).isNotNull()
+        )
+        after_missing = df_combined.count()
+        n_missing = before_missing - after_missing
+        print(f"   ✅ Đã loại bỏ {n_missing} bản ghi thiếu giá hoặc thời gian")
+        
+        # 3. Flag outliers (không xóa, chỉ flag) - Logic giống batch file
+        from pyspark.sql.functions import percentile_approx
+        from decimal import Decimal
+        
+        def to_float(val):
+            if val is None:
+                return None
+            if isinstance(val, Decimal):
+                return float(val)
+            return float(val)
+        
+        try:
+            buy_q1_val = df_combined.select(percentile_approx("BUY_PRICE", 0.25).alias("q1")).first()[0]
+            buy_q3_val = df_combined.select(percentile_approx("BUY_PRICE", 0.75).alias("q3")).first()[0]
+            buy_q1 = to_float(buy_q1_val)
+            buy_q3 = to_float(buy_q3_val)
+            buy_iqr = buy_q3 - buy_q1
+            buy_lower = buy_q1 - 1.5 * buy_iqr
+            buy_upper = buy_q3 + 1.5 * buy_iqr
+            
+            sell_q1_val = df_combined.select(percentile_approx("SELL_PRICE", 0.25).alias("q1")).first()[0]
+            sell_q3_val = df_combined.select(percentile_approx("SELL_PRICE", 0.75).alias("q3")).first()[0]
+            sell_q1 = to_float(sell_q1_val)
+            sell_q3 = to_float(sell_q3_val)
+            sell_iqr = sell_q3 - sell_q1
+            sell_lower = sell_q1 - 1.5 * sell_iqr
+            sell_upper = sell_q3 + 1.5 * sell_iqr
+            
+            df_combined = df_combined.withColumn(
+                "IS_DELETED",
+                when(
+                    (col("BUY_PRICE") < lit(buy_lower)) | (col("BUY_PRICE") > lit(buy_upper)) |
+                    (col("SELL_PRICE") < lit(sell_lower)) | (col("SELL_PRICE") > lit(sell_upper)),
+                    lit(1)
+                ).otherwise(lit(0))
+            )
+            
+            n_outliers = df_combined.filter(col("IS_DELETED") == 1).count()
+            print(f"   ✅ Đã flag {n_outliers} bản ghi outlier (IS_DELETED=1)")
+        except Exception as e:
+            print(f"   ⚠️ Không thể flag outliers: {e}. Giữ nguyên dữ liệu.")
+            if "IS_DELETED" not in df_combined.columns:
+                df_combined = df_combined.withColumn("IS_DELETED", lit(0))
+        
+        # Đảm bảo có cột IS_DELETE (nếu cần)
+        if "IS_DELETE" not in df_combined.columns:
+            df_combined = df_combined.withColumn("IS_DELETE", col("IS_DELETED"))
+        
+        # Ghi lại bảng CLEAN với dữ liệu đã merge và đã clean
+        final_count = df_combined.count()
+        write_table_to_oracle(df_combined, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+        print(f"✅ Đã merge và clean: {final_count} records (thêm {processed_count} mới, giữ {existing_count} cũ)")
         
         # Cập nhật checkpoint với timestamp mới nhất
         max_ts = df_processed.agg(spark_max(col(TIMESTAMP_COLUMN))).first()[0]
@@ -353,21 +601,33 @@ def process_batch(batch_id: int, batch_df: 'DataFrame',
             print(f"✅ Đã cập nhật checkpoint: {max_ts}")
     
     except Exception as e:
-        print(f"⚠️ Lỗi khi merge với CLEAN: {e}")
-        # Nếu lỗi, chỉ append dữ liệu mới
-        write_table_to_oracle(df_processed, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "append")
-        print(f"✅ Đã append {df_processed.count()} records mới")
+        # Nếu bảng CLEAN chưa có, ghi dữ liệu mới (chỉ lần đầu)
+        print(f"⚠️ Bảng CLEAN chưa có hoặc lỗi: {e}. Ghi dữ liệu mới...")
+        # Apply basic cleaning trước khi ghi
+        df_processed = df_processed.filter(
+            col("BUY_PRICE").isNotNull() & 
+            col("SELL_PRICE").isNotNull() & 
+            col(TIMESTAMP_COLUMN).isNotNull()
+        )
+        if "IS_DELETED" not in df_processed.columns:
+            df_processed = df_processed.withColumn("IS_DELETED", lit(0))
+        if "IS_DELETE" not in df_processed.columns:
+            df_processed = df_processed.withColumn("IS_DELETE", lit(0))
+        write_table_to_oracle(df_processed, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+        print(f"✅ Đã ghi {df_processed.count()} records vào GOLD_PRICE_FACT_CLEAN (lần đầu)")
 
 def create_oracle_polling_stream(spark: SparkSession, table_name: str,
-                                location_mapping: Dict, type_mapping: Dict,
-                                trigger_interval: str = STREAMING_TRIGGER_INTERVAL):
+                                trigger_interval: str = STREAMING_TRIGGER_INTERVAL,
+                                clean_all: bool = False,
+                                merge_types: bool = False):
     """
     Tạo Spark Structured Streaming query để polling Oracle.
     
     Cách hoạt động:
     1. Dùng rate source để tạo trigger (emit 1 row mỗi interval)
     2. Dùng foreachBatch để polling Oracle mỗi interval
-    3. Spark tự động quản lý checkpoint và recovery
+    3. Nếu clean_all=True, sẽ clean tất cả bảng mỗi khi FACT thay đổi
+    4. Spark tự động quản lý checkpoint và recovery
     """
     
     # Tạo rate source - emit 1 row mỗi interval để trigger foreachBatch
@@ -384,8 +644,8 @@ def create_oracle_polling_stream(spark: SparkSession, table_name: str,
     # Tạo streaming query với foreachBatch
     def foreach_batch_wrapper(batch_id, batch_df):
         # Bỏ qua batch_df (chỉ là trigger)
-        # Gọi process_batch để polling Oracle
-        process_batch(batch_id, batch_df, spark, table_name, location_mapping, type_mapping)
+        # Gọi process_batch để polling Oracle và clean nếu cần
+        process_batch(batch_id, batch_df, spark, table_name, clean_all, merge_types)
     
     # Tạo streaming query
     query = trigger_df.writeStream \
@@ -404,7 +664,11 @@ def main():
     parser.add_argument("--interval", type=str, default=STREAMING_TRIGGER_INTERVAL,
                        help="Trigger interval (ví dụ: '30 seconds', '1 minute')")
     parser.add_argument("--table", type=str, default="GOLD_PRICE_FACT",
-                       help="Tên bảng Oracle để monitor")
+                       help="Tên bảng Oracle để monitor (GOLD_PRICE_FACT, LOCATION_DIMENSION, GOLD_TYPE_DIMENSION)")
+    parser.add_argument("--clean-all", action="store_true",
+                       help="Khi FACT thay đổi, tự động clean TẤT CẢ các bảng (LOCATION, TYPE, FACT)")
+    parser.add_argument("--merge-types", action="store_true",
+                       help="Gộp TYPE tương đồng khi clean (chỉ dùng với --clean-all)")
     
     args = parser.parse_args()
     
@@ -419,21 +683,38 @@ def main():
     print(f"📊 Table: {args.table}")
     print(f"⏱️  Trigger Interval: {args.interval}")
     print(f"📁 Checkpoint: {STREAMING_CHECKPOINT_DIR}")
+    if args.clean_all:
+        print(f"🔄 Mode: Clean ALL tables khi FACT thay đổi")
+        print(f"   ✅ LOCATION_DIMENSION → LOCATION_DIMENSION_CLEAN")
+        print(f"   ✅ GOLD_TYPE_DIMENSION → GOLD_TYPE_DIMENSION_CLEAN")
+        print(f"   ✅ GOLD_PRICE_FACT → GOLD_PRICE_FACT_CLEAN")
+        if args.merge_types:
+            print(f"   ✅ Merge duplicate types: ON")
+    else:
+        print(f"🔄 Mode: Streaming FACT only (chỉ xử lý FACT)")
     print("="*60 + "\n")
     
-    # Load dimension mappings (chạy một lần, có thể refresh định kỳ)
-    print("📊 Đang load dimension mappings...")
-    location_mapping, type_mapping = load_dimension_mappings(spark)
-    print(f"✅ Location mappings: {len(location_mapping)}")
-    print(f"✅ Type mappings: {len(type_mapping)}")
+    # Kiểm tra batch functions có sẵn không
+    if args.clean_all and not BATCH_FUNCTIONS_AVAILABLE:
+        print("❌ Lỗi: Không thể import batch functions để clean dimensions!")
+        print("   Vui lòng đảm bảo các dependencies đã được cài:")
+        print("   pip install pandas numpy scikit-learn fuzzywuzzy python-Levenshtein")
+        print("\n   Hoặc chạy không có --clean-all để chỉ xử lý FACT")
+        sys.exit(1)
+    
+    # Chỉ streaming FACT table
+    if args.table != "GOLD_PRICE_FACT":
+        print(f"⚠️ Lưu ý: Streaming chỉ hỗ trợ GOLD_PRICE_FACT")
+        print(f"   Đang chuyển sang GOLD_PRICE_FACT...\n")
+        args.table = "GOLD_PRICE_FACT"
     
     # Khởi động streaming query
     query = create_oracle_polling_stream(
         spark, 
         args.table, 
-        location_mapping, 
-        type_mapping,
-        args.interval
+        args.interval,
+        args.clean_all,
+        args.merge_types
     )
     
     print(f"\n✅ Streaming query đã khởi động!")
