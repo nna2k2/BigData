@@ -825,16 +825,29 @@ def flag_price_outliers(spark: SparkSession, last_run: dt.datetime):
 
     # Calculate IQR for BUY_PRICE and SELL_PRICE using Spark
     from pyspark.sql.functions import percentile_approx
+    from decimal import Decimal
     
-    # Get quantiles using Spark
-    buy_q1 = df_fact.select(percentile_approx("BUY_PRICE", 0.25).alias("q1")).first()[0]
-    buy_q3 = df_fact.select(percentile_approx("BUY_PRICE", 0.75).alias("q3")).first()[0]
+    # Helper function to convert Decimal to float
+    def to_float(val):
+        if val is None:
+            return None
+        if isinstance(val, Decimal):
+            return float(val)
+        return float(val)
+    
+    # Get quantiles using Spark (Oracle trả về Decimal, cần convert sang float)
+    buy_q1_val = df_fact.select(percentile_approx("BUY_PRICE", 0.25).alias("q1")).first()[0]
+    buy_q3_val = df_fact.select(percentile_approx("BUY_PRICE", 0.75).alias("q3")).first()[0]
+    buy_q1 = to_float(buy_q1_val)
+    buy_q3 = to_float(buy_q3_val)
     buy_iqr = buy_q3 - buy_q1
     buy_lower = buy_q1 - 1.5 * buy_iqr
     buy_upper = buy_q3 + 1.5 * buy_iqr
     
-    sell_q1 = df_fact.select(percentile_approx("SELL_PRICE", 0.25).alias("q1")).first()[0]
-    sell_q3 = df_fact.select(percentile_approx("SELL_PRICE", 0.75).alias("q3")).first()[0]
+    sell_q1_val = df_fact.select(percentile_approx("SELL_PRICE", 0.25).alias("q1")).first()[0]
+    sell_q3_val = df_fact.select(percentile_approx("SELL_PRICE", 0.75).alias("q3")).first()[0]
+    sell_q1 = to_float(sell_q1_val)
+    sell_q3 = to_float(sell_q3_val)
     sell_iqr = sell_q3 - sell_q1
     sell_lower = sell_q1 - 1.5 * sell_iqr
     sell_upper = sell_q3 + 1.5 * sell_iqr
