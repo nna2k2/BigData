@@ -336,6 +336,7 @@ def normalize_locations(spark: SparkSession) -> Dict[int, int]:
     print(f"🔎 Mapping location (old->new): {mapping}")
 
     # Áp dụng mapping để tạo bảng CLEAN
+    # Đảm bảo TẤT CẢ dữ liệu gốc đều có trong CLEAN (chỉ merge ID, không mất record)
     if mapping:
         # Tạo mapping DataFrame
         mapping_df = spark.createDataFrame(
@@ -343,7 +344,7 @@ def normalize_locations(spark: SparkSession) -> Dict[int, int]:
             ["OLD_ID", "NEW_ID"]
         )
         
-        # Join để map ID cũ -> ID mới
+        # Join LEFT để đảm bảo tất cả record gốc đều được giữ lại
         df_clean = df_loc.join(
             mapping_df,
             df_loc["ID"] == mapping_df["OLD_ID"],
@@ -351,24 +352,31 @@ def normalize_locations(spark: SparkSession) -> Dict[int, int]:
         ).withColumn(
             "ID_CLEAN",
             when(col("NEW_ID").isNotNull(), col("NEW_ID"))
-            .otherwise(col("ID"))
+            .otherwise(col("ID"))  # Giữ nguyên ID nếu không có mapping
         ).select(
             col("ID_CLEAN").alias("ID"),
             col("CITY"),
             col("REGION")
         )
     else:
+        # Không có mapping, copy toàn bộ dữ liệu gốc
         df_clean = df_loc.select("ID", "CITY", "REGION")
 
-    # Lấy distinct để loại bỏ duplicate sau khi merge
+    # Lấy distinct để loại bỏ duplicate sau khi merge (chỉ loại bỏ những record trùng hoàn toàn)
     df_final = df_clean.distinct()
     
     # Log số lượng record
     original_count = df_loc.count()
     final_count = df_final.count()
     print(f"📊 LOCATION_DIMENSION: {original_count} records -> LOCATION_DIMENSION_CLEAN: {final_count} records")
+    
+    # Đảm bảo luôn có dữ liệu trong bảng CLEAN (copy toàn bộ nếu cần)
+    if final_count == 0 and original_count > 0:
+        print("⚠️ Cảnh báo: Bảng CLEAN rỗng nhưng bảng gốc có dữ liệu! Copy toàn bộ dữ liệu gốc...")
+        df_final = df_loc.select("ID", "CITY", "REGION")
+        final_count = original_count
 
-    # Ghi vào bảng _CLEAN
+    # Ghi vào bảng _CLEAN (luôn có dữ liệu, kể cả không có gì để clean)
     write_table_to_oracle(df_final, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
     snapshot_table(df_final, "LOCATION_DIMENSION_CLEAN", "after_loc_norm")
     
@@ -423,27 +431,36 @@ def enrich_gold_types(spark: SparkSession) -> Tuple[int, int]:
                 category_fill += 1
 
     # Apply updates to Spark DataFrame
+    # Đảm bảo luôn copy toàn bộ dữ liệu gốc, kể cả không có gì để enrich
     df_enriched = df
-    for tid, update_dict in updates.items():
-        if "PURITY" in update_dict:
-            df_enriched = df_enriched.withColumn(
-                "PURITY",
-                when(col("ID") == tid, lit(update_dict["PURITY"]))
-                .otherwise(col("PURITY"))
-            )
-        if "CATEGORY" in update_dict:
-            df_enriched = df_enriched.withColumn(
-                "CATEGORY",
-                when(col("ID") == tid, lit(update_dict["CATEGORY"]))
-                .otherwise(col("CATEGORY"))
-            )
+    if updates:  # Chỉ update nếu có thay đổi
+        for tid, update_dict in updates.items():
+            if "PURITY" in update_dict:
+                df_enriched = df_enriched.withColumn(
+                    "PURITY",
+                    when(col("ID") == tid, lit(update_dict["PURITY"]))
+                    .otherwise(col("PURITY"))
+                )
+            if "CATEGORY" in update_dict:
+                df_enriched = df_enriched.withColumn(
+                    "CATEGORY",
+                    when(col("ID") == tid, lit(update_dict["CATEGORY"]))
+                    .otherwise(col("CATEGORY"))
+                )
+    # Nếu không có updates, df_enriched = df (giữ nguyên toàn bộ dữ liệu gốc)
 
     # Log số lượng record
     original_count = df.count()
     enriched_count = df_enriched.count()
     print(f"📊 GOLD_TYPE_DIMENSION: {original_count} records -> GOLD_TYPE_DIMENSION_CLEAN: {enriched_count} records")
     
-    # Ghi vào bảng _CLEAN
+    # Đảm bảo luôn có dữ liệu trong bảng CLEAN (copy toàn bộ nếu cần)
+    if enriched_count == 0 and original_count > 0:
+        print("⚠️ Cảnh báo: Bảng CLEAN rỗng nhưng bảng gốc có dữ liệu! Copy toàn bộ dữ liệu gốc...")
+        df_enriched = df
+        enriched_count = original_count
+    
+    # Ghi vào bảng _CLEAN (luôn có dữ liệu, kể cả không có gì để clean)
     write_table_to_oracle(df_enriched, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
     snapshot_table(df_enriched, "GOLD_TYPE_DIMENSION_CLEAN", "after_type_enrich")
 
@@ -618,19 +635,28 @@ def merge_duplicate_types_and_update_fact(spark: SparkSession):
         for row in mapping_df.collect():
             mapping[int(row["OLD_ID"])] = int(row["NEW_ID"])
     
-    # Create clean table with only canonical IDs
+    # Create clean table - Đảm bảo TẤT CẢ dữ liệu gốc đều có trong CLEAN
     # Chỉ select các cột có tồn tại
-    select_cols = ["ID", "TYPE_NAME", "PURITY", "CATEGORY"]
+    select_cols = ["TYPE_NAME", "PURITY", "CATEGORY"]
     if "BRAND" in columns:
         select_cols.append("BRAND")
     
-    df_clean = df_with_canon.filter(col("ID") == col("CANON_ID")) \
-        .select(*select_cols) \
-        .distinct()
+    # Lấy tất cả record với ID đã được normalize (canonical ID)
+    # Điều này đảm bảo tất cả record gốc đều có trong CLEAN (chỉ ID được merge)
+    df_clean = df_with_canon.select(
+        col("CANON_ID").alias("ID"),
+        *[col(c) for c in select_cols]
+    ).distinct()
+    
+    # Đảm bảo số lượng không bị mất quá nhiều
+    original_count = df.count()
+    clean_count = df_clean.count()
+    if clean_count < original_count * 0.8:  # Nếu mất > 20% thì có vấn đề
+        print(f"⚠️ Cảnh báo: Số lượng record giảm từ {original_count} xuống {clean_count}")
     
     write_table_to_oracle(df_clean, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
     
-    print(f"✅ Đã gộp {len(mapping)} TYPE trùng.")
+    print(f"✅ Đã gộp {len(mapping)} TYPE trùng. Giữ lại {clean_count}/{original_count} records trong CLEAN.")
     return mapping
 
 def normalize_gold_type_and_unit(spark: SparkSession):
@@ -694,7 +720,9 @@ def dedup_fact_incremental(spark: SparkSession, last_run: dt.datetime, location_
     return n_dup
 
 def handle_missing_values_fact(spark: SparkSession, last_run: dt.datetime):
-    """Xử lý missing values trong FACT và cập nhật GOLD_PRICE_FACT_CLEAN."""
+    """Xử lý missing values trong FACT và cập nhật GOLD_PRICE_FACT_CLEAN.
+    Chỉ loại bỏ record thiếu critical fields, còn lại giữ nguyên.
+    """
     df_fact = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
     
     if df_fact.count() == 0:
@@ -703,7 +731,8 @@ def handle_missing_values_fact(spark: SparkSession, last_run: dt.datetime):
 
     before_count = df_fact.count()
     
-    # Drop records missing critical fields
+    # Chỉ loại bỏ record thiếu critical fields (BUY_PRICE, SELL_PRICE, TIME_ID)
+    # Các record khác giữ nguyên để đảm bảo có đầy đủ dữ liệu
     df_clean = df_fact.filter(
         col("BUY_PRICE").isNotNull() &
         col("SELL_PRICE").isNotNull() &
@@ -857,7 +886,13 @@ def main():
     fact_after_mapping_count = df_fact_all.count()
     print(f"📊 GOLD_PRICE_FACT sau mapping: {fact_after_mapping_count} records")
     
-    # Write initial clean fact table
+    # Đảm bảo luôn có dữ liệu trong bảng CLEAN (copy toàn bộ nếu cần)
+    if fact_after_mapping_count == 0 and fact_original_count > 0:
+        print("⚠️ Cảnh báo: Sau mapping bảng CLEAN rỗng nhưng bảng gốc có dữ liệu! Copy toàn bộ dữ liệu gốc...")
+        df_fact_all = read_table_from_oracle(spark, "GOLD_PRICE_FACT", DB_USER)
+        fact_after_mapping_count = df_fact_all.count()
+    
+    # Write initial clean fact table (luôn có dữ liệu, kể cả không có gì để clean)
     write_table_to_oracle(df_fact_all, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
     print(f"✅ Đã ghi {fact_after_mapping_count} records vào GOLD_PRICE_FACT_CLEAN")
     
