@@ -531,11 +531,25 @@ def normalize_text(s: str) -> str:
 
 def normalize_category_smart(spark: SparkSession) -> int:
     """Chuẩn hoá CATEGORY trong GOLD_TYPE_DIMENSION_CLEAN."""
+    # Đọc lại bảng CLEAN (có thể cần refresh cache)
     df = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
     
-    if df.count() == 0:
-        print("⚠️ GOLD_TYPE_DIMENSION_CLEAN trống.")
-        return 0
+    # Cache để tránh đọc lại nhiều lần
+    df.cache()
+    record_count = df.count()
+    
+    if record_count == 0:
+        print("⚠️ GOLD_TYPE_DIMENSION_CLEAN trống. Kiểm tra lại bảng gốc...")
+        # Fallback: đọc từ bảng gốc nếu CLEAN trống
+        df_original = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION", DB_USER)
+        if df_original.count() > 0:
+            print("⚠️ Bảng CLEAN trống nhưng bảng gốc có dữ liệu. Copy từ bảng gốc...")
+            write_table_to_oracle(df_original, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+            df = df_original
+            df.cache()
+            record_count = df.count()
+        else:
+            return 0
 
     pandas_df = df.toPandas()
     pandas_df["CLEAN"] = pandas_df["CATEGORY"].astype(str).apply(normalize_text)
@@ -683,15 +697,29 @@ def normalize_gold_type_and_unit(spark: SparkSession):
 # -------------------- FACT dedup incremental --------------------
 
 def dedup_fact_incremental(spark: SparkSession, last_run: dt.datetime, location_mapping: Dict, type_mapping: Dict):
-    """Deduplicate FACT và cập nhật GOLD_PRICE_FACT_CLEAN."""
+    """Deduplicate FACT và cập nhật GOLD_PRICE_FACT_CLEAN.
+    Xử lý TOÀN BỘ dữ liệu, không chỉ incremental.
+    """
     # Đọc từ bảng CLEAN đã được tạo (mappings đã được apply)
     df_fact = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
     
-    if df_fact.count() == 0:
-        print("ℹ️ Không có FACT để dedup.")
-        return 0
-
+    # Cache để tránh đọc lại nhiều lần
+    df_fact.cache()
     before_count = df_fact.count()
+    
+    if before_count == 0:
+        print("⚠️ GOLD_PRICE_FACT_CLEAN trống. Kiểm tra lại bảng gốc...")
+        # Fallback: đọc từ bảng gốc nếu CLEAN trống
+        df_original = read_table_from_oracle(spark, "GOLD_PRICE_FACT", DB_USER)
+        if df_original.count() > 0:
+            print("⚠️ Bảng CLEAN trống nhưng bảng gốc có dữ liệu. Copy từ bảng gốc...")
+            write_table_to_oracle(df_original, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+            df_fact = df_original
+            df_fact.cache()
+            before_count = df_fact.count()
+        else:
+            print("ℹ️ Không có FACT để dedup.")
+            return 0
 
     # Create combo key
     df_fact = df_fact.withColumn(
@@ -704,32 +732,62 @@ def dedup_fact_incremental(spark: SparkSession, last_run: dt.datetime, location_
     )
 
     # Keep latest record per combo
-    window_spec = Window.partitionBy("COMBO").orderBy(col("RECORDED_AT").desc())
-    df_clean = df_fact.withColumn("rn", row_number().over(window_spec)) \
+    # Đảm bảo RECORDED_AT không null để tránh lỗi khi sort
+    df_fact_with_combo = df_fact.withColumn(
+        "RECORDED_AT_SAFE",
+        when(col("RECORDED_AT").isNotNull(), col("RECORDED_AT"))
+        .otherwise(lit(dt.datetime(2000, 1, 1)))  # Default cho null
+    )
+    
+    window_spec = Window.partitionBy("COMBO").orderBy(col("RECORDED_AT_SAFE").desc())
+    df_clean = df_fact_with_combo.withColumn("rn", row_number().over(window_spec)) \
         .filter(col("rn") == 1) \
-        .drop("rn", "COMBO") \
+        .drop("rn", "COMBO", "RECORDED_AT_SAFE") \
         .withColumn("IS_DELETED", lit(0)) \
         .withColumn("IS_DELETE", lit(0))
 
-    n_dup = before_count - df_clean.count()
+    clean_count = df_clean.count()
+    n_dup = before_count - clean_count
+    
+    # Đảm bảo không mất quá nhiều dữ liệu
+    if clean_count == 0 and before_count > 0:
+        print(f"❌ Lỗi: Sau dedup bảng CLEAN rỗng! Giữ lại toàn bộ dữ liệu gốc...")
+        # Fallback: giữ lại tất cả, chỉ thêm IS_DELETED
+        df_clean = df_fact.drop("COMBO") if "COMBO" in df_fact.columns else df_fact
+        df_clean = df_clean.withColumn("IS_DELETED", lit(0)).withColumn("IS_DELETE", lit(0))
+        clean_count = df_clean.count()
+        n_dup = 0
+        print(f"⚠️ Đã khôi phục {clean_count} records")
 
     write_table_to_oracle(df_clean, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
     snapshot_table(df_clean, "GOLD_PRICE_FACT_CLEAN", "after_fact_dedup")
     
-    print(f"🧹 Đã tạo GOLD_PRICE_FACT_CLEAN với {df_clean.count()} bản ghi (loại bỏ {n_dup} trùng).")
+    print(f"🧹 Đã tạo GOLD_PRICE_FACT_CLEAN với {clean_count} bản ghi (loại bỏ {n_dup} trùng).")
     return n_dup
 
 def handle_missing_values_fact(spark: SparkSession, last_run: dt.datetime):
     """Xử lý missing values trong FACT và cập nhật GOLD_PRICE_FACT_CLEAN.
     Chỉ loại bỏ record thiếu critical fields, còn lại giữ nguyên.
+    Xử lý TOÀN BỘ dữ liệu, không chỉ incremental.
     """
     df_fact = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
     
-    if df_fact.count() == 0:
-        print("ℹ️ Không có dữ liệu để xử lý missing values.")
-        return 0
-
+    # Cache để tránh đọc lại nhiều lần
+    df_fact.cache()
     before_count = df_fact.count()
+    
+    if before_count == 0:
+        print("⚠️ GOLD_PRICE_FACT_CLEAN trống. Kiểm tra lại bảng gốc...")
+        df_original = read_table_from_oracle(spark, "GOLD_PRICE_FACT", DB_USER)
+        if df_original.count() > 0:
+            print("⚠️ Bảng CLEAN trống nhưng bảng gốc có dữ liệu. Copy từ bảng gốc...")
+            write_table_to_oracle(df_original, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+            df_fact = df_original
+            df_fact.cache()
+            before_count = df_fact.count()
+        else:
+            print("ℹ️ Không có dữ liệu để xử lý missing values.")
+            return 0
     
     # Chỉ loại bỏ record thiếu critical fields (BUY_PRICE, SELL_PRICE, TIME_ID)
     # Các record khác giữ nguyên để đảm bảo có đầy đủ dữ liệu
@@ -845,10 +903,33 @@ def main():
     normalize_gold_type_and_unit(spark)
 
     # B3: FACT dedup incremental -> GOLD_PRICE_FACT_CLEAN
-    # Đọc toàn bộ FACT và apply mappings, sau đó dedup
-    df_fact_all = read_table_from_oracle(spark, "GOLD_PRICE_FACT", DB_USER)
+    # Lấy dữ liệu MỚI từ bảng gốc (dựa trên checkpoint)
+    floor_ts = last_run - dt.timedelta(days=1)  # Chừa biên 1 ngày để an toàn
+    
+    # Đọc dữ liệu MỚI từ bảng gốc
+    df_fact_new = read_table_from_oracle(spark, "GOLD_PRICE_FACT", DB_USER)
+    df_fact_new = df_fact_new.filter(col("RECORDED_AT") >= lit(floor_ts))
+    fact_new_count = df_fact_new.count()
+    print(f"📊 GOLD_PRICE_FACT gốc: {df_fact.count()} records")
+    print(f"📊 GOLD_PRICE_FACT MỚI (sau {last_run}): {fact_new_count} records")
+    
+    # Nếu có dữ liệu mới, xử lý và merge vào CLEAN
+    if fact_new_count > 0:
+        df_fact_all = df_fact_new
+    else:
+        print("ℹ️ Không có dữ liệu mới, chỉ cập nhật bảng CLEAN hiện có")
+        # Đọc bảng CLEAN hiện có để giữ nguyên
+        try:
+            df_fact_all = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
+            fact_new_count = df_fact_all.count()
+            print(f"📊 Giữ nguyên {fact_new_count} records trong GOLD_PRICE_FACT_CLEAN")
+        except:
+            # Nếu bảng CLEAN chưa có, đọc toàn bộ từ gốc
+            df_fact_all = read_table_from_oracle(spark, "GOLD_PRICE_FACT", DB_USER)
+            fact_new_count = df_fact_all.count()
+            print(f"📊 Bảng CLEAN chưa có, copy toàn bộ {fact_new_count} records từ gốc")
+    
     fact_original_count = df_fact_all.count()
-    print(f"📊 GOLD_PRICE_FACT gốc: {fact_original_count} records")
     
     # Apply location mapping
     if location_mapping:
@@ -886,17 +967,28 @@ def main():
     fact_after_mapping_count = df_fact_all.count()
     print(f"📊 GOLD_PRICE_FACT sau mapping: {fact_after_mapping_count} records")
     
-    # Đảm bảo luôn có dữ liệu trong bảng CLEAN (copy toàn bộ nếu cần)
-    if fact_after_mapping_count == 0 and fact_original_count > 0:
-        print("⚠️ Cảnh báo: Sau mapping bảng CLEAN rỗng nhưng bảng gốc có dữ liệu! Copy toàn bộ dữ liệu gốc...")
-        df_fact_all = read_table_from_oracle(spark, "GOLD_PRICE_FACT", DB_USER)
-        fact_after_mapping_count = df_fact_all.count()
+    # Merge dữ liệu mới vào bảng CLEAN (không overwrite toàn bộ)
+    try:
+        # Đọc bảng CLEAN hiện có
+        df_fact_existing = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
+        existing_count = df_fact_existing.count()
+        print(f"📊 GOLD_PRICE_FACT_CLEAN hiện có: {existing_count} records")
+        
+        # Union dữ liệu mới với dữ liệu cũ
+        df_fact_combined = df_fact_existing.unionByName(df_fact_all, allowMissingColumns=True)
+        combined_count = df_fact_combined.count()
+        print(f"📊 Sau merge: {combined_count} records (cũ: {existing_count}, mới: {fact_after_mapping_count})")
+        
+        # Ghi lại bảng CLEAN với dữ liệu đã merge
+        write_table_to_oracle(df_fact_combined, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+        print(f"✅ Đã merge {fact_after_mapping_count} records mới vào GOLD_PRICE_FACT_CLEAN")
+    except Exception as e:
+        # Nếu bảng CLEAN chưa có, ghi dữ liệu mới
+        print(f"⚠️ Bảng CLEAN chưa có hoặc lỗi: {e}. Ghi dữ liệu mới...")
+        write_table_to_oracle(df_fact_all, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+        print(f"✅ Đã ghi {fact_after_mapping_count} records vào GOLD_PRICE_FACT_CLEAN")
     
-    # Write initial clean fact table (luôn có dữ liệu, kể cả không có gì để clean)
-    write_table_to_oracle(df_fact_all, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
-    print(f"✅ Đã ghi {fact_after_mapping_count} records vào GOLD_PRICE_FACT_CLEAN")
-    
-    # Then apply dedup and other cleaning
+    # Then apply dedup and other cleaning (xử lý toàn bộ bảng CLEAN)
     dedup_fact_incremental(spark, last_run, {}, {})  # Mappings already applied
     handle_missing_values_fact(spark, last_run)
     flag_price_outliers(spark, last_run)
