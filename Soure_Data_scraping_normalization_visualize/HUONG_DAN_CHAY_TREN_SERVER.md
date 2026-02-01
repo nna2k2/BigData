@@ -36,17 +36,24 @@ sudo yum install python3-pip -y
 
 ### 1.3. Cài đặt PySpark và dependencies
 
+**Lưu ý: KHÔNG CẦN cài Spark riêng!** PySpark sẽ tự động tải Spark khi chạy.
+
 ```bash
 # Tạo virtual environment (khuyến nghị)
 python3 -m venv venv
 source venv/bin/activate
 
-# Cài đặt dependencies
+# Cài đặt dependencies (chỉ cần PySpark, không cần Spark riêng)
 pip install pyspark pandas numpy scikit-learn fuzzywuzzy python-Levenshtein
 
 # Hoặc từ file requirements
 pip install -r requirements_spark.txt
 ```
+
+**PySpark sẽ tự động:**
+- Tải Spark binaries lần đầu chạy (có thể mất vài phút)
+- Cache để lần sau chạy nhanh hơn
+- Chạy ở local mode (`local[*]`) - không cần cluster
 
 ## Bước 2: Upload files lên Server
 
@@ -142,12 +149,14 @@ conn.close()
 # Activate virtual environment (nếu dùng)
 source venv/bin/activate
 
-# Chạy job
+# Chạy job (KHÔNG CẦN spark-submit, chỉ cần python3)
 python3 daily_gold_job_normalization_spark.py
-
-# Hoặc với spark-submit (nếu có Spark standalone)
-spark-submit --jars ojdbc8.jar daily_gold_job_normalization_spark.py
 ```
+
+**Lưu ý:**
+- Lần đầu chạy có thể mất vài phút để PySpark tải Spark binaries
+- Không cần `spark-submit`, chỉ cần `python3`
+- PySpark tự động xử lý mọi thứ
 
 ### 4.2. Chạy với option merge-types
 

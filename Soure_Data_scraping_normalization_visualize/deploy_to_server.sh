@@ -40,12 +40,30 @@ else
     exit 1
 fi
 
-# Bước 3: Tạo virtual environment
+# Bước 3: Kiểm tra và cài python3-venv
 echo ""
-echo "📦 Bước 3: Tạo virtual environment..."
+echo "📦 Bước 3: Kiểm tra python3-venv..."
+if ! python3 -m venv --help &> /dev/null; then
+    echo "⚠️ python3-venv chưa được cài đặt"
+    echo "   Đang cài đặt..."
+    apt update
+    apt install -y python3-venv
+    echo "✅ Đã cài đặt python3-venv"
+fi
+
+# Bước 3.1: Tạo virtual environment
+echo ""
+echo "📦 Bước 3.1: Tạo virtual environment..."
 if [ ! -d "venv" ]; then
     python3 -m venv venv
-    echo "✅ Đã tạo virtual environment"
+    if [ $? -eq 0 ]; then
+        echo "✅ Đã tạo virtual environment"
+    else
+        echo "❌ Lỗi khi tạo virtual environment"
+        echo "   Thử cài: apt install python3-venv"
+        echo "   Hoặc chạy job không cần venv (xem QUICK_SETUP.md)"
+        exit 1
+    fi
 else
     echo "✅ Virtual environment đã tồn tại"
 fi

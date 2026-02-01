@@ -88,7 +88,11 @@ def create_spark_session(ojdbc_path: str = None, java_home: str = None):
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
         .config("spark.driver.memory", "2g") \
-        .config("spark.executor.memory", "2g")
+        .config("spark.executor.memory", "2g") \
+        .config("spark.ui.enabled", "true") \
+        .config("spark.ui.port", "4040") \
+        .config("spark.driver.bindAddress", "0.0.0.0") \
+        .config("spark.driver.host", os.environ.get("SPARK_DRIVER_HOST", "0.0.0.0"))
     
     # Xác định đường dẫn JDBC driver
     # Ưu tiên: 1) tham số hàm, 2) config OJDBC_JAR_PATH, 3) tự động tìm
@@ -131,6 +135,34 @@ def create_spark_session(ojdbc_path: str = None, java_home: str = None):
         print("   Xem hướng dẫn: HUONG_DAN_TAI_OJDBC.md")
     
     spark = builder.getOrCreate()
+    
+    # Log thông tin Spark để chứng minh đang dùng Spark
+    print("\n" + "="*60)
+    print("🚀 SPARK SESSION INFORMATION")
+    print("="*60)
+    print(f"✅ Spark Version: {spark.version}")
+    print(f"✅ Spark Master: {spark.sparkContext.master}")
+    print(f"✅ Spark App Name: {spark.sparkContext.appName}")
+    print(f"✅ Spark App ID: {spark.sparkContext.applicationId}")
+    
+    # Lấy IP/hostname của server để hiển thị Spark UI URL
+    import socket
+    try:
+        hostname = socket.gethostname()
+        # Lấy IP address
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        server_ip = s.getsockname()[0]
+        s.close()
+        print(f"✅ Spark UI: http://{server_ip}:4040 hoặc http://{hostname}:4040")
+        print(f"   (Truy cập từ bên ngoài: http://<SERVER_IP>:4040)")
+    except:
+        print(f"✅ Spark UI: http://localhost:4040 hoặc http://<SERVER_IP>:4040")
+    
+    print(f"✅ Default Parallelism: {spark.sparkContext.defaultParallelism}")
+    print(f"✅ Total Cores: {spark.sparkContext._conf.get('spark.executor.cores', 'N/A')}")
+    print("="*60 + "\n")
+    
     return spark
 
 def read_table_from_oracle(spark: SparkSession, table_name: str, schema: str = None) -> 'DataFrame':
@@ -1010,6 +1042,39 @@ def main():
     now = dt.datetime.now()
     set_checkpoint(spark, now)
     print(f"✅ Job hoàn tất. Checkpoint mới: {now}")
+    
+    # In thông tin Spark để chứng minh
+    print("\n" + "="*60)
+    print("📊 THÔNG TIN SPARK EXECUTION")
+    print("="*60)
+    print(f"✅ Spark Version: {spark.version}")
+    print(f"✅ Spark App ID: {spark.sparkContext.applicationId}")
+    print(f"✅ Spark Master: {spark.sparkContext.master}")
+    print(f"✅ Total Records Processed:")
+    
+    # Đếm records từ bảng CLEAN
+    try:
+        df_loc_clean = read_table_from_oracle(spark, "LOCATION_DIMENSION_CLEAN", DB_USER)
+        loc_clean_count = df_loc_clean.count()
+    except:
+        loc_clean_count = 0
+    
+    try:
+        df_type_clean = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
+        type_clean_count = df_type_clean.count()
+    except:
+        type_clean_count = 0
+    
+    try:
+        df_fact_clean = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
+        fact_clean_count = df_fact_clean.count()
+    except:
+        fact_clean_count = 0
+    
+    print(f"   - LOCATION_DIMENSION: {df_loc.count()} → LOCATION_DIMENSION_CLEAN: {loc_clean_count}")
+    print(f"   - GOLD_TYPE_DIMENSION: {df_type.count()} → GOLD_TYPE_DIMENSION_CLEAN: {type_clean_count}")
+    print(f"   - GOLD_PRICE_FACT: {df_fact.count()} → GOLD_PRICE_FACT_CLEAN: {fact_clean_count}")
+    print("="*60)
 
     # Snapshot cuối
     df_loc_clean = read_table_from_oracle(spark, "LOCATION_DIMENSION_CLEAN", DB_USER)
