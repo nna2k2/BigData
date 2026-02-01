@@ -1020,7 +1020,7 @@ def main():
     fact_after_mapping_count = df_fact_all.count()
     print(f"📊 GOLD_PRICE_FACT sau mapping: {fact_after_mapping_count} records")
     
-    # Merge dữ liệu mới vào bảng CLEAN (không overwrite toàn bộ)
+    # Merge dữ liệu mới vào bảng CLEAN (CHỈ THÊM, KHÔNG XÓA DỮ LIỆU CŨ)
     try:
         # Đọc bảng CLEAN hiện có
         df_fact_existing = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
@@ -1032,19 +1032,116 @@ def main():
         combined_count = df_fact_combined.count()
         print(f"📊 Sau merge: {combined_count} records (cũ: {existing_count}, mới: {fact_after_mapping_count})")
         
-        # Ghi lại bảng CLEAN với dữ liệu đã merge
+        # Apply cleaning trên dữ liệu đã merge (dedup, handle missing, flag outliers)
+        # Nhưng chỉ xử lý trên dữ liệu đã merge, không đọc lại từ DB
+        print("🧹 Đang xử lý cleaning trên dữ liệu đã merge...")
+        
+        # 1. Dedup trên toàn bộ dữ liệu đã merge
+        df_fact_combined = df_fact_combined.cache()
+        before_dedup = df_fact_combined.count()
+        
+        # Tạo composite key để dedup
+        df_fact_combined = df_fact_combined.withColumn(
+            "COMBO",
+            concat_ws("|", 
+                col("SOURCE_ID").cast("string"),
+                col("TYPE_ID").cast("string"),
+                col("LOCATION_ID").cast("string"),
+                col("TIME_ID").cast("string")
+            )
+        ).withColumn(
+            "RECORDED_AT_SAFE",
+            coalesce(col("RECORDED_AT"), to_timestamp(lit("2000-01-01 00:00:00")))
+        )
+        
+        window_spec = Window.partitionBy("COMBO").orderBy(col("RECORDED_AT_SAFE").desc())
+        df_fact_combined = df_fact_combined.withColumn("rn", row_number().over(window_spec)) \
+            .filter(col("rn") == 1) \
+            .drop("rn", "COMBO", "RECORDED_AT_SAFE")
+        
+        after_dedup = df_fact_combined.count()
+        n_dup = before_dedup - after_dedup
+        print(f"   ✅ Đã loại bỏ {n_dup} bản ghi trùng")
+        
+        # 2. Handle missing values (chỉ loại bỏ record thiếu critical fields)
+        before_missing = df_fact_combined.count()
+        df_fact_combined = df_fact_combined.filter(
+            col("BUY_PRICE").isNotNull() & 
+            col("SELL_PRICE").isNotNull() & 
+            col("RECORDED_AT").isNotNull()
+        )
+        after_missing = df_fact_combined.count()
+        n_missing = before_missing - after_missing
+        print(f"   ✅ Đã loại bỏ {n_missing} bản ghi thiếu giá hoặc thời gian")
+        
+        # 3. Flag outliers (không xóa, chỉ flag)
+        from pyspark.sql.functions import percentile_approx
+        from decimal import Decimal
+        
+        def to_float(val):
+            if val is None:
+                return None
+            if isinstance(val, Decimal):
+                return float(val)
+            return float(val)
+        
+        try:
+            buy_q1_val = df_fact_combined.select(percentile_approx("BUY_PRICE", 0.25).alias("q1")).first()[0]
+            buy_q3_val = df_fact_combined.select(percentile_approx("BUY_PRICE", 0.75).alias("q3")).first()[0]
+            buy_q1 = to_float(buy_q1_val)
+            buy_q3 = to_float(buy_q3_val)
+            buy_iqr = buy_q3 - buy_q1
+            buy_lower = buy_q1 - 1.5 * buy_iqr
+            buy_upper = buy_q3 + 1.5 * buy_iqr
+            
+            sell_q1_val = df_fact_combined.select(percentile_approx("SELL_PRICE", 0.25).alias("q1")).first()[0]
+            sell_q3_val = df_fact_combined.select(percentile_approx("SELL_PRICE", 0.75).alias("q3")).first()[0]
+            sell_q1 = to_float(sell_q1_val)
+            sell_q3 = to_float(sell_q3_val)
+            sell_iqr = sell_q3 - sell_q1
+            sell_lower = sell_q1 - 1.5 * sell_iqr
+            sell_upper = sell_q3 + 1.5 * sell_iqr
+            
+            df_fact_combined = df_fact_combined.withColumn(
+                "IS_DELETED",
+                when(
+                    (col("BUY_PRICE") < lit(buy_lower)) | (col("BUY_PRICE") > lit(buy_upper)) |
+                    (col("SELL_PRICE") < lit(sell_lower)) | (col("SELL_PRICE") > lit(sell_upper)),
+                    lit(1)
+                ).otherwise(lit(0))
+            )
+            
+            n_outliers = df_fact_combined.filter(col("IS_DELETED") == 1).count()
+            print(f"   ✅ Đã flag {n_outliers} bản ghi outlier (IS_DELETED=1)")
+        except Exception as e:
+            print(f"   ⚠️ Không thể flag outliers: {e}. Giữ nguyên dữ liệu.")
+            if "IS_DELETED" not in df_fact_combined.columns:
+                df_fact_combined = df_fact_combined.withColumn("IS_DELETED", lit(0))
+        
+        # Đảm bảo có cột IS_DELETE (nếu cần)
+        if "IS_DELETE" not in df_fact_combined.columns:
+            df_fact_combined = df_fact_combined.withColumn("IS_DELETE", col("IS_DELETED"))
+        
+        # Ghi lại bảng CLEAN với dữ liệu đã merge và đã clean
+        final_count = df_fact_combined.count()
         write_table_to_oracle(df_fact_combined, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
-        print(f"✅ Đã merge {fact_after_mapping_count} records mới vào GOLD_PRICE_FACT_CLEAN")
+        print(f"✅ Đã merge và clean: {final_count} records (thêm {fact_after_mapping_count} mới, giữ {existing_count} cũ)")
+        
     except Exception as e:
-        # Nếu bảng CLEAN chưa có, ghi dữ liệu mới
+        # Nếu bảng CLEAN chưa có, ghi dữ liệu mới (chỉ lần đầu)
         print(f"⚠️ Bảng CLEAN chưa có hoặc lỗi: {e}. Ghi dữ liệu mới...")
+        # Apply basic cleaning trước khi ghi
+        df_fact_all = df_fact_all.filter(
+            col("BUY_PRICE").isNotNull() & 
+            col("SELL_PRICE").isNotNull() & 
+            col("RECORDED_AT").isNotNull()
+        )
+        if "IS_DELETED" not in df_fact_all.columns:
+            df_fact_all = df_fact_all.withColumn("IS_DELETED", lit(0))
+        if "IS_DELETE" not in df_fact_all.columns:
+            df_fact_all = df_fact_all.withColumn("IS_DELETE", lit(0))
         write_table_to_oracle(df_fact_all, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
-        print(f"✅ Đã ghi {fact_after_mapping_count} records vào GOLD_PRICE_FACT_CLEAN")
-    
-    # Then apply dedup and other cleaning (xử lý toàn bộ bảng CLEAN)
-    dedup_fact_incremental(spark, last_run, {}, {})  # Mappings already applied
-    handle_missing_values_fact(spark, last_run)
-    flag_price_outliers(spark, last_run)
+        print(f"✅ Đã ghi {df_fact_all.count()} records vào GOLD_PRICE_FACT_CLEAN (lần đầu)")
 
     # Cập nhật checkpoint
     now = dt.datetime.now()
