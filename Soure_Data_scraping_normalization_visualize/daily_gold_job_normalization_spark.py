@@ -82,6 +82,11 @@ def create_spark_session(ojdbc_path: str = None, java_home: str = None):
                 print(f"✅ Tự động tìm thấy Java: {java_path}")
                 break
     
+    # Tạo thư mục event logs nếu chưa có
+    event_log_dir = os.path.join(os.path.dirname(__file__), "spark-events")
+    os.makedirs(event_log_dir, exist_ok=True)
+    event_log_path = f"file://{os.path.abspath(event_log_dir)}"
+    
     builder = SparkSession.builder \
         .appName(SPARK_APP_NAME) \
         .master(SPARK_MASTER) \
@@ -92,7 +97,10 @@ def create_spark_session(ojdbc_path: str = None, java_home: str = None):
         .config("spark.ui.enabled", "true") \
         .config("spark.ui.port", "4040") \
         .config("spark.driver.bindAddress", "0.0.0.0") \
-        .config("spark.driver.host", os.environ.get("SPARK_DRIVER_HOST", "0.0.0.0"))
+        .config("spark.driver.host", os.environ.get("SPARK_DRIVER_HOST", "0.0.0.0")) \
+        .config("spark.eventLog.enabled", "true") \
+        .config("spark.eventLog.dir", event_log_path) \
+        .config("spark.eventLog.compress", "true")
     
     # Xác định đường dẫn JDBC driver
     # Ưu tiên: 1) tham số hàm, 2) config OJDBC_JAR_PATH, 3) tự động tìm
