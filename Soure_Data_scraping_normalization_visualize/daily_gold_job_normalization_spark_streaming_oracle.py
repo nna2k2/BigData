@@ -14,8 +14,6 @@ import datetime as dt
 import os
 from typing import Dict, List, Tuple, Optional
 
-import numpy as np
-import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.functions import (
@@ -29,13 +27,6 @@ from pyspark.sql.types import (
     TimestampType, DoubleType, LongType
 )
 from pyspark.sql.window import Window
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from fuzzywuzzy import fuzz
-
-import re
-import unicodedata
 
 # ====================== CONFIG ======================
 DB_USER = "CLOUD"
