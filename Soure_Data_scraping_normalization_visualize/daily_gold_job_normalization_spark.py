@@ -156,8 +156,41 @@ def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "overwri
         .mode(mode) \
         .save()
 
+def ensure_checkpoint_table(spark: SparkSession):
+    """Đảm bảo bảng ETL_CHECKPOINT tồn tại, nếu chưa có thì tạo."""
+    try:
+        # Thử đọc bảng để kiểm tra xem có tồn tại không
+        read_table_from_oracle(spark, "ETL_CHECKPOINT", DB_USER)
+        print("✅ Bảng ETL_CHECKPOINT đã tồn tại")
+    except Exception as e:
+        # Bảng chưa tồn tại, tạo mới
+        print("⚠️ Bảng ETL_CHECKPOINT chưa tồn tại, đang tạo mới...")
+        try:
+            # Tạo bảng bằng cách tạo DataFrame rỗng với schema đúng và ghi vào
+            from pyspark.sql.types import StructType, StructField, StringType, TimestampType
+            
+            schema = StructType([
+                StructField("JOB_NAME", StringType(), False),
+                StructField("LAST_RUN", TimestampType(), True)
+            ])
+            
+            empty_df = spark.createDataFrame([], schema)
+            write_table_to_oracle(empty_df, f"{DB_USER}.ETL_CHECKPOINT", "overwrite")
+            print("✅ Đã tạo bảng ETL_CHECKPOINT")
+        except Exception as create_error:
+            print(f"⚠️ Không thể tạo bảng ETL_CHECKPOINT tự động: {create_error}")
+            print("   Vui lòng tạo bảng thủ công bằng SQL:")
+            print(f"   CREATE TABLE {DB_USER}.ETL_CHECKPOINT (")
+            print(f"       JOB_NAME VARCHAR2(100) PRIMARY KEY,")
+            print(f"       LAST_RUN TIMESTAMP")
+            print(f"   );")
+            print("   Hoặc chạy file: create_etl_checkpoint.sql")
+
 def get_last_checkpoint(spark: SparkSession) -> dt.datetime:
     """Lấy checkpoint cuối cùng từ ETL_CHECKPOINT."""
+    # Đảm bảo bảng tồn tại
+    ensure_checkpoint_table(spark)
+    
     try:
         df = read_table_from_oracle(spark, "ETL_CHECKPOINT", DB_USER)
         df_checkpoint = df.filter(col("JOB_NAME") == JOB_NAME)
@@ -173,6 +206,9 @@ def get_last_checkpoint(spark: SparkSession) -> dt.datetime:
 
 def set_checkpoint(spark: SparkSession, ts: dt.datetime):
     """Cập nhật checkpoint."""
+    # Đảm bảo bảng tồn tại
+    ensure_checkpoint_table(spark)
+    
     checkpoint_df = spark.createDataFrame(
         [(JOB_NAME, ts)],
         ["JOB_NAME", "LAST_RUN"]
@@ -326,6 +362,11 @@ def normalize_locations(spark: SparkSession) -> Dict[int, int]:
 
     # Lấy distinct để loại bỏ duplicate sau khi merge
     df_final = df_clean.distinct()
+    
+    # Log số lượng record
+    original_count = df_loc.count()
+    final_count = df_final.count()
+    print(f"📊 LOCATION_DIMENSION: {original_count} records -> LOCATION_DIMENSION_CLEAN: {final_count} records")
 
     # Ghi vào bảng _CLEAN
     write_table_to_oracle(df_final, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
@@ -397,6 +438,11 @@ def enrich_gold_types(spark: SparkSession) -> Tuple[int, int]:
                 .otherwise(col("CATEGORY"))
             )
 
+    # Log số lượng record
+    original_count = df.count()
+    enriched_count = df_enriched.count()
+    print(f"📊 GOLD_TYPE_DIMENSION: {original_count} records -> GOLD_TYPE_DIMENSION_CLEAN: {enriched_count} records")
+    
     # Ghi vào bảng _CLEAN
     write_table_to_oracle(df_enriched, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
     snapshot_table(df_enriched, "GOLD_TYPE_DIMENSION_CLEAN", "after_type_enrich")
@@ -532,20 +578,30 @@ def merge_duplicate_types_and_update_fact(spark: SparkSession):
         print("⚠️ GOLD_TYPE_DIMENSION_CLEAN trống.")
         return {}
 
+    # Kiểm tra các cột có tồn tại không
+    columns = df.columns
     df_normalized = df.withColumn(
         "TYPE_NAME_NORM", lower(trim(col("TYPE_NAME")))
     ).withColumn(
         "PURITY_NORM", lower(trim(col("PURITY")))
     ).withColumn(
         "CATEGORY_NORM", lower(trim(col("CATEGORY")))
-    ).withColumn(
-        "BRAND_NORM", lower(trim(col("BRAND")))
     )
+    
+    # Chỉ thêm BRAND_NORM nếu cột BRAND tồn tại
+    if "BRAND" in columns:
+        df_normalized = df_normalized.withColumn(
+            "BRAND_NORM", lower(trim(col("BRAND")))
+        )
+        partition_cols = ["TYPE_NAME_NORM", "PURITY_NORM", "CATEGORY_NORM", "BRAND_NORM"]
+    else:
+        # Tạo cột BRAND_NORM rỗng nếu không có BRAND
+        df_normalized = df_normalized.withColumn("BRAND_NORM", lit(""))
+        partition_cols = ["TYPE_NAME_NORM", "PURITY_NORM", "CATEGORY_NORM", "BRAND_NORM"]
+        print("⚠️ Cột BRAND không tồn tại, sử dụng giá trị rỗng cho BRAND_NORM")
 
     # Group by normalized values and find canonical ID
-    window_spec = Window.partitionBy(
-        "TYPE_NAME_NORM", "PURITY_NORM", "CATEGORY_NORM", "BRAND_NORM"
-    ).orderBy("ID")
+    window_spec = Window.partitionBy(*partition_cols).orderBy("ID")
     
     df_with_canon = df_normalized.withColumn(
         "CANON_ID",
@@ -563,8 +619,13 @@ def merge_duplicate_types_and_update_fact(spark: SparkSession):
             mapping[int(row["OLD_ID"])] = int(row["NEW_ID"])
     
     # Create clean table with only canonical IDs
+    # Chỉ select các cột có tồn tại
+    select_cols = ["ID", "TYPE_NAME", "PURITY", "CATEGORY"]
+    if "BRAND" in columns:
+        select_cols.append("BRAND")
+    
     df_clean = df_with_canon.filter(col("ID") == col("CANON_ID")) \
-        .select("ID", "TYPE_NAME", "PURITY", "CATEGORY", "BRAND") \
+        .select(*select_cols) \
         .distinct()
     
     write_table_to_oracle(df_clean, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
@@ -576,15 +637,22 @@ def normalize_gold_type_and_unit(spark: SparkSession):
     """Chuẩn hóa BRAND và UNIT."""
     df_type = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
     
-    df_type_clean = df_type.withColumn(
-        "BRAND",
-        when(col("BRAND").isNotNull(),
-             upper(trim(regexp_replace(regexp_replace(col("BRAND"), "\\.", ""), "VÀNG ", ""))))
-        .otherwise(col("BRAND"))
-    )
+    # Kiểm tra xem cột BRAND có tồn tại không
+    columns = df_type.columns
+    df_type_clean = df_type
+    
+    if "BRAND" in columns:
+        df_type_clean = df_type_clean.withColumn(
+            "BRAND",
+            when(col("BRAND").isNotNull(),
+                 upper(trim(regexp_replace(regexp_replace(col("BRAND"), "\\.", ""), "VÀNG ", ""))))
+            .otherwise(col("BRAND"))
+        )
+        print("📏 Đã chuẩn hóa BRAND.")
+    else:
+        print("⚠️ Cột BRAND không tồn tại trong GOLD_TYPE_DIMENSION_CLEAN, bỏ qua chuẩn hóa BRAND.")
     
     write_table_to_oracle(df_type_clean, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
-    print("📏 Đã chuẩn hóa BRAND.")
 
 # -------------------- FACT dedup incremental --------------------
 
@@ -719,6 +787,12 @@ def main():
     df_type = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION", DB_USER)
     df_fact = read_table_from_oracle(spark, "GOLD_PRICE_FACT", DB_USER)
     
+    # Log số lượng record gốc
+    print(f"\n📊 Số lượng dữ liệu gốc:")
+    print(f"   LOCATION_DIMENSION: {df_loc.count()} records")
+    print(f"   GOLD_TYPE_DIMENSION: {df_type.count()} records")
+    print(f"   GOLD_PRICE_FACT: {df_fact.count()} records\n")
+    
     snapshot_table(df_loc, "LOCATION_DIMENSION", "before")
     snapshot_table(df_type, "GOLD_TYPE_DIMENSION", "before")
     snapshot_table(df_fact, "GOLD_PRICE_FACT", "before")
@@ -744,6 +818,8 @@ def main():
     # B3: FACT dedup incremental -> GOLD_PRICE_FACT_CLEAN
     # Đọc toàn bộ FACT và apply mappings, sau đó dedup
     df_fact_all = read_table_from_oracle(spark, "GOLD_PRICE_FACT", DB_USER)
+    fact_original_count = df_fact_all.count()
+    print(f"📊 GOLD_PRICE_FACT gốc: {fact_original_count} records")
     
     # Apply location mapping
     if location_mapping:
@@ -777,8 +853,13 @@ def main():
             .otherwise(col("TYPE_ID"))
         ).drop("OLD_TYPE_ID", "NEW_TYPE_ID")
     
+    # Log số lượng sau khi apply mappings
+    fact_after_mapping_count = df_fact_all.count()
+    print(f"📊 GOLD_PRICE_FACT sau mapping: {fact_after_mapping_count} records")
+    
     # Write initial clean fact table
     write_table_to_oracle(df_fact_all, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+    print(f"✅ Đã ghi {fact_after_mapping_count} records vào GOLD_PRICE_FACT_CLEAN")
     
     # Then apply dedup and other cleaning
     dedup_fact_incremental(spark, last_run, {}, {})  # Mappings already applied
