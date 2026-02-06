@@ -361,6 +361,9 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
         existing_loc_count = 0
         print("📊 LOCATION_CLEAN chưa có, sẽ tạo mới")
     
+    # Clear cache để đảm bảo đọc dữ liệu mới nhất
+    spark.catalog.clearCache()
+    
     # Gọi normalize_locations (sẽ overwrite, nhưng ta sẽ merge lại sau)
     try:
         location_mapping = normalize_locations(spark)
@@ -371,23 +374,61 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
         location_mapping = {}
         print("⚠️ Sử dụng location_mapping rỗng, giữ nguyên dữ liệu CLEAN hiện có")
     
+    # Clear cache lại sau khi normalize
+    spark.catalog.clearCache()
+    
     # Đọc CLEAN mới sau khi normalize
     try:
         df_loc_clean_new = read_table_from_oracle(spark, "LOCATION_DIMENSION_CLEAN", DB_USER)
         new_loc_count = df_loc_clean_new.count()
         
+        # Kiểm tra nếu bảng CLEAN mới rỗng nhưng có dữ liệu cũ
+        if new_loc_count == 0 and existing_loc_count > 0:
+            print("⚠️ Bảng CLEAN mới rỗng nhưng có dữ liệu cũ. Giữ nguyên dữ liệu cũ...")
+            write_table_to_oracle(df_loc_clean_existing, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
+            print(f"✅ Đã giữ nguyên LOCATION_DIMENSION_CLEAN: {existing_loc_count} records")
+        
         # Merge: Giữ nguyên CLEAN cũ + CLEAN mới (union và distinct)
-        if df_loc_clean_existing is not None and existing_loc_count > 0:
+        elif df_loc_clean_existing is not None and existing_loc_count > 0:
             df_loc_clean_combined = df_loc_clean_existing.unionByName(df_loc_clean_new, allowMissingColumns=True)
             df_loc_clean_final = df_loc_clean_combined.distinct()
             final_count = df_loc_clean_final.count()
             
-            write_table_to_oracle(df_loc_clean_final, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
-            print(f"✅ Đã cập nhật LOCATION_DIMENSION_CLEAN: {final_count} records (giữ {existing_loc_count} cũ)")
+            # Đảm bảo có dữ liệu trước khi ghi
+            if final_count > 0:
+                write_table_to_oracle(df_loc_clean_final, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
+                print(f"✅ Đã cập nhật LOCATION_DIMENSION_CLEAN: {final_count} records (giữ {existing_loc_count} cũ)")
+            else:
+                print("⚠️ Sau merge không còn dữ liệu! Giữ nguyên dữ liệu cũ...")
+                write_table_to_oracle(df_loc_clean_existing, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
+                print(f"✅ Đã giữ nguyên LOCATION_DIMENSION_CLEAN: {existing_loc_count} records")
         else:
-            print(f"✅ Đã tạo LOCATION_DIMENSION_CLEAN: {new_loc_count} records")
+            # Kiểm tra nếu bảng CLEAN mới có dữ liệu
+            if new_loc_count > 0:
+                print(f"✅ Đã tạo LOCATION_DIMENSION_CLEAN: {new_loc_count} records")
+            else:
+                print("⚠️ Bảng CLEAN mới rỗng! Kiểm tra lại bảng gốc...")
+                # Fallback: đọc từ bảng gốc
+                try:
+                    df_original = read_table_from_oracle(spark, "LOCATION_DIMENSION", DB_USER)
+                    original_count = df_original.count()
+                    if original_count > 0:
+                        print(f"⚠️ Copy {original_count} records từ bảng gốc...")
+                        write_table_to_oracle(df_original, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
+                        print(f"✅ Đã copy từ bảng gốc: {original_count} records")
+                    else:
+                        print("❌ Bảng gốc cũng trống!")
+                except Exception as e2:
+                    print(f"❌ Không thể copy từ bảng gốc: {e2}")
     except Exception as e:
         print(f"⚠️ Lỗi khi merge LOCATION_CLEAN: {e}")
+        # Fallback: giữ nguyên dữ liệu cũ nếu có
+        if df_loc_clean_existing is not None and existing_loc_count > 0:
+            try:
+                write_table_to_oracle(df_loc_clean_existing, f"{DB_USER}.LOCATION_DIMENSION_CLEAN", "overwrite")
+                print(f"✅ Đã giữ nguyên dữ liệu cũ: {existing_loc_count} records")
+            except:
+                pass
     
     print(f"✅ Location mapping: {len(location_mapping)} mappings")
     
@@ -404,6 +445,9 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
         existing_type_count = 0
         print("📊 TYPE_CLEAN chưa có, sẽ tạo mới")
     
+    # Clear cache để đảm bảo đọc dữ liệu mới nhất
+    spark.catalog.clearCache()
+    
     # Gọi các hàm enrich (sẽ overwrite, nhưng ta sẽ merge lại sau)
     try:
         enrich_gold_types(spark)
@@ -414,10 +458,20 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
         print(f"   Traceback: {type(e).__name__}: {str(e)}")
         print("⚠️ Giữ nguyên dữ liệu TYPE_CLEAN hiện có")
     
+    # Clear cache lại sau khi gọi các hàm
+    spark.catalog.clearCache()
+    
     # Đọc CLEAN mới sau khi enrich
     try:
         df_type_clean_new = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
         new_type_count = df_type_clean_new.count()
+        
+        # Kiểm tra nếu bảng CLEAN mới rỗng nhưng có dữ liệu cũ
+        if new_type_count == 0 and existing_type_count > 0:
+            print("⚠️ Bảng CLEAN mới rỗng nhưng có dữ liệu cũ. Giữ nguyên dữ liệu cũ...")
+            write_table_to_oracle(df_type_clean_existing, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+            print(f"✅ Đã giữ nguyên GOLD_TYPE_DIMENSION_CLEAN: {existing_type_count} records")
+            return location_mapping, {}
         
         # Merge: Giữ nguyên CLEAN cũ + CLEAN mới (union và distinct)
         if df_type_clean_existing is not None and existing_type_count > 0:
@@ -430,12 +484,41 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
                 .distinct()
             final_count = df_type_clean_final.count()
             
-            write_table_to_oracle(df_type_clean_final, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
-            print(f"✅ Đã cập nhật GOLD_TYPE_DIMENSION_CLEAN: {final_count} records (giữ {existing_type_count} cũ)")
+            # Đảm bảo có dữ liệu trước khi ghi
+            if final_count > 0:
+                write_table_to_oracle(df_type_clean_final, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                print(f"✅ Đã cập nhật GOLD_TYPE_DIMENSION_CLEAN: {final_count} records (giữ {existing_type_count} cũ)")
+            else:
+                print("⚠️ Sau merge không còn dữ liệu! Giữ nguyên dữ liệu cũ...")
+                write_table_to_oracle(df_type_clean_existing, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                print(f"✅ Đã giữ nguyên GOLD_TYPE_DIMENSION_CLEAN: {existing_type_count} records")
         else:
-            print(f"✅ Đã tạo GOLD_TYPE_DIMENSION_CLEAN: {new_type_count} records")
+            # Kiểm tra nếu bảng CLEAN mới có dữ liệu
+            if new_type_count > 0:
+                print(f"✅ Đã tạo GOLD_TYPE_DIMENSION_CLEAN: {new_type_count} records")
+            else:
+                print("⚠️ Bảng CLEAN mới rỗng! Kiểm tra lại bảng gốc...")
+                # Fallback: đọc từ bảng gốc
+                try:
+                    df_original = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION", DB_USER)
+                    original_count = df_original.count()
+                    if original_count > 0:
+                        print(f"⚠️ Copy {original_count} records từ bảng gốc...")
+                        write_table_to_oracle(df_original, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                        print(f"✅ Đã copy từ bảng gốc: {original_count} records")
+                    else:
+                        print("❌ Bảng gốc cũng trống!")
+                except Exception as e2:
+                    print(f"❌ Không thể copy từ bảng gốc: {e2}")
     except Exception as e:
         print(f"⚠️ Lỗi khi merge TYPE_CLEAN: {e}")
+        # Fallback: giữ nguyên dữ liệu cũ nếu có
+        if df_type_clean_existing is not None and existing_type_count > 0:
+            try:
+                write_table_to_oracle(df_type_clean_existing, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                print(f"✅ Đã giữ nguyên dữ liệu cũ: {existing_type_count} records")
+            except:
+                pass
     
     # (Tuỳ chọn) gộp TYPE tương đồng
     type_mapping = {}
