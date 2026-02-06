@@ -60,11 +60,12 @@ except ImportError as e:
     BATCH_FUNCTIONS_AVAILABLE = False
 
 # ====================== CONFIG ======================
-DB_USER = "CLOUD"
-DB_PASS = "cloud123"
-DB_HOST = "136.110.60.196"
-DB_PORT = "1521"
-DB_SERVICE = "XEPDB1"
+# Đọc từ environment variables (Docker) hoặc dùng giá trị mặc định
+DB_USER = os.environ.get("DB_USER", "SYSTEM")
+DB_PASS = os.environ.get("DB_PASS", "Welcome_1234")
+DB_HOST = os.environ.get("DB_HOST", "136.110.60.196")
+DB_PORT = os.environ.get("DB_PORT", "1521")
+DB_SERVICE = os.environ.get("DB_SERVICE", "XEPDB1")
 
 DB_DSN = f"{DB_HOST}:{DB_PORT}/{DB_SERVICE}"
 DB_URL = f"jdbc:oracle:thin:@{DB_DSN}"
