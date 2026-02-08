@@ -365,9 +365,53 @@ def delete_all_from_oracle_table(spark: SparkSession, table_name: str):
     try:
         import jaydebeapi
         url = f"jdbc:oracle:thin:{DB_USER}/{DB_PASS}@{DB_DSN}"
-        conn = jaydebeapi.connect("oracle.jdbc.driver.OracleDriver", 
-                                url, 
-                                [DB_USER, DB_PASS])
+        
+        # Tìm Oracle JDBC driver JAR file
+        # Có thể ở các vị trí: classpath, thư mục libs, hoặc trong Spark jars
+        import os
+        import glob
+        
+        # Tìm ojdbc*.jar trong các thư mục thường dùng
+        possible_paths = [
+            "/opt/oracle/ojdbc*.jar",
+            "/usr/lib/oracle/*/client/lib/ojdbc*.jar",
+            "./libs/ojdbc*.jar",
+            "./venv/lib/python*/site-packages/jaydebeapi/ojdbc*.jar",
+            os.path.expanduser("~/ojdbc*.jar"),
+        ]
+        
+        ojdbc_path = None
+        for pattern in possible_paths:
+            matches = glob.glob(pattern)
+            if matches:
+                ojdbc_path = matches[0]
+                break
+        
+        # Nếu không tìm thấy, thử dùng driver từ Spark (nếu có)
+        if not ojdbc_path:
+            # Spark thường có ojdbc trong jars
+            spark_jars = os.environ.get('SPARK_JARS', '')
+            if 'ojdbc' in spark_jars.lower():
+                # Spark đã có driver, không cần path
+                ojdbc_path = None
+            else:
+                print(f"   ⚠️ Không tìm thấy Oracle JDBC driver (ojdbc*.jar)")
+                print(f"   💡 Download từ: https://www.oracle.com/database/technologies/appdev/jdbc-downloads.html")
+                print(f"   💡 Đặt vào: ./libs/ojdbc8.jar hoặc set CLASSPATH")
+                raise ImportError("Oracle JDBC driver not found")
+        
+        # Kết nối với jaydebeapi
+        if ojdbc_path:
+            conn = jaydebeapi.connect("oracle.jdbc.driver.OracleDriver", 
+                                    url, 
+                                    [DB_USER, DB_PASS],
+                                    jars=ojdbc_path)
+        else:
+            # Thử không cần path (nếu driver đã có trong classpath)
+            conn = jaydebeapi.connect("oracle.jdbc.driver.OracleDriver", 
+                                    url, 
+                                    [DB_USER, DB_PASS])
+        
         cursor = conn.cursor()
         cursor.execute(f"DELETE FROM {table_name}")
         conn.commit()
@@ -378,7 +422,14 @@ def delete_all_from_oracle_table(spark: SparkSession, table_name: str):
     except ImportError:
         pass
     except Exception as e:
-        print(f"   ⚠️ Lỗi với jaydebeapi: {e}")
+        error_msg = str(e)
+        if "Class oracle.jdbc.driver.OracleDriver is not found" in error_msg:
+            print(f"   ⚠️ Lỗi với jaydebeapi: {e}")
+            print(f"   💡 Cần Oracle JDBC driver JAR file (ojdbc8.jar hoặc ojdbc11.jar)")
+            print(f"   💡 Download từ: https://www.oracle.com/database/technologies/appdev/jdbc-downloads.html")
+            print(f"   💡 Đặt vào: ./libs/ojdbc8.jar hoặc set CLASSPATH")
+        else:
+            print(f"   ⚠️ Lỗi với jaydebeapi: {e}")
     
     # Thử cx_Oracle
     try:
