@@ -756,10 +756,20 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
                     when(col("BRAND").isNull(), lit("")).otherwise(col("BRAND"))
                 )
         
-        # Select với thứ tự đúng: ID trước, sau đó các cột khác
+        # ⚠️ QUAN TRỌNG: Select với thứ tự đúng với schema trong DB
+        # DB có thứ tự: ID, CATEGORY, PURITY, TYPE_NAME, BRAND
+        # Đảm bảo thứ tự cột khớp với DB để tránh Spark JDBC tạo lại bảng với schema sai
+        ordered_cols = ["ID", "CATEGORY", "PURITY", "TYPE_NAME"]
+        if "BRAND" in select_cols:
+            ordered_cols.append("BRAND")
+        
+        # Select với thứ tự đúng
         df_clean_merged = df_clean_merged.select(
             col("CANON_ID").alias("ID"),
-            *[col(c) for c in select_cols]
+            col("CATEGORY"),
+            col("PURITY"),
+            col("TYPE_NAME"),
+            *([col("BRAND")] if "BRAND" in select_cols else [])
         )
         
         # ⚠️ QUAN TRỌNG: Đảm bảo BRAND không NULL sau khi select
@@ -888,7 +898,9 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             try:
                 sample = df_clean_merged.limit(5).collect()
                 for i, row in enumerate(sample, 1):
-                    print(f"         {i}. ID={row['ID']}, TYPE_NAME={row.get('TYPE_NAME', 'N/A')[:30]}")
+                    row_dict = row.asDict()
+                    type_name = str(row_dict.get('TYPE_NAME', 'N/A'))[:30] if row_dict.get('TYPE_NAME') else 'N/A'
+                    print(f"         {i}. ID={row_dict.get('ID', 'N/A')}, TYPE_NAME={type_name}")
             except Exception as e:
                 print(f"         ⚠️ Không thể lấy sample: {e}")
             
@@ -913,9 +925,11 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
                     try:
                         sample_written = df_clean_merged.limit(3).collect()
                         for i, row in enumerate(sample_written, 1):
-                            print(f"      {i}. ID={row['ID']}, TYPE_NAME={row.get('TYPE_NAME', 'N/A')[:30]}")
-                    except:
-                        pass
+                            row_dict = row.asDict()
+                            type_name = str(row_dict.get('TYPE_NAME', 'N/A'))[:30] if row_dict.get('TYPE_NAME') else 'N/A'
+                            print(f"      {i}. ID={row_dict.get('ID', 'N/A')}, TYPE_NAME={type_name}")
+                    except Exception as e:
+                        print(f"      ⚠️ Không thể lấy sample: {e}")
                     write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
                     print(f"   ✅ Đã khôi phục {original_count} records")
                     return mapping
