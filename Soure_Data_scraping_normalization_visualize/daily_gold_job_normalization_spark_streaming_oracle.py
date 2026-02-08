@@ -306,17 +306,33 @@ def update_checkpoint(spark: SparkSession, ts: dt.datetime):
         raise
 
 def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "append"):
-    """Ghi DataFrame vào Oracle DB."""
+    """
+    Ghi DataFrame vào Oracle DB.
+    
+    ⚠️ QUAN TRỌNG: Khi dùng mode="overwrite", Spark JDBC có thể drop và tạo lại bảng.
+    Đảm bảo DataFrame có đúng schema và thứ tự cột trước khi ghi.
+    """
     if df.count() == 0:
+        print(f"   ⚠️ DataFrame rỗng, không ghi vào {table_name}")
         return
     
-    df.write \
-        .format("jdbc") \
-        .option("url", f"jdbc:oracle:thin:{DB_USER}/{DB_PASS}@{DB_DSN}") \
-        .option("dbtable", table_name) \
-        .option("driver", "oracle.jdbc.driver.OracleDriver") \
-        .mode(mode) \
-        .save()
+    # Log schema trước khi ghi
+    print(f"   📝 Ghi vào {table_name} với mode={mode}")
+    print(f"   📝 Schema: {df.columns}")
+    print(f"   📝 Số records: {df.count()}")
+    
+    try:
+        df.write \
+            .format("jdbc") \
+            .option("url", f"jdbc:oracle:thin:{DB_USER}/{DB_PASS}@{DB_DSN}") \
+            .option("dbtable", table_name) \
+            .option("driver", "oracle.jdbc.driver.OracleDriver") \
+            .mode(mode) \
+            .save()
+        print(f"   ✅ Đã ghi thành công vào {table_name}")
+    except Exception as e:
+        print(f"   ❌ Lỗi khi ghi vào {table_name}: {e}")
+        raise
 
 def get_fact_schema():
     """Schema cho GOLD_PRICE_FACT."""
@@ -518,11 +534,13 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
     
     # Tạo bảng CLEAN mới: merge các records trùng (giữ 1 record cho mỗi CANON_ID)
     # ⚠️ QUAN TRỌNG: CHỈ xử lý bảng CLEAN, KHÔNG động đến bảng gốc
+    # ⚠️ QUAN TRỌNG: Đảm bảo thứ tự cột đúng với schema Oracle: ID, TYPE_NAME, PURITY, CATEGORY, BRAND
     select_cols = ["TYPE_NAME", "PURITY", "CATEGORY"]
     if "BRAND" in columns:
         select_cols.append("BRAND")
     
     print(f"   📝 Các cột sẽ giữ lại: {select_cols}")
+    print(f"   📝 Các cột có sẵn trong df_with_canon: {df_with_canon.columns}")
     
     # Lấy giá trị từ canonical record (ID nhỏ nhất) trong mỗi group
     window_spec_clean = Window.partitionBy("CANON_ID").orderBy("ID")
@@ -539,16 +557,30 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
     after_filter_count = df_clean_merged.count()
     print(f"   📊 Số records sau filter ROW_NUM=1: {after_filter_count}")
     
-    # Select các cột cần thiết
+    # Select các cột cần thiết - đảm bảo đúng thứ tự: ID, TYPE_NAME, PURITY, CATEGORY, BRAND
     try:
+        # Kiểm tra từng cột có tồn tại không
+        missing_cols = [c for c in select_cols if c not in df_clean_merged.columns]
+        if missing_cols:
+            print(f"   ❌ Lỗi: Thiếu các cột: {missing_cols}")
+            print(f"   📝 Các cột có sẵn: {df_clean_merged.columns}")
+            print(f"   📊 Giữ nguyên dữ liệu CLEAN cũ: {original_count} records")
+            return mapping
+        
+        # Select với thứ tự đúng: ID trước, sau đó các cột khác
         df_clean_merged = df_clean_merged.select(
             col("CANON_ID").alias("ID"),
             *[col(c) for c in select_cols]
         )
+        
+        # Kiểm tra schema sau khi select
+        print(f"   📝 Schema sau select: {df_clean_merged.columns}")
+        print(f"   📝 Số cột: {len(df_clean_merged.columns)}")
+        
     except Exception as e:
         print(f"   ❌ Lỗi khi select columns: {e}")
-        print(f"   📝 Các cột có sẵn: {df_with_canon.columns}")
-        print(f"   📝 Các cột cần select: {select_cols}")
+        print(f"   📝 Các cột có sẵn: {df_clean_merged.columns}")
+        print(f"   📝 Các cột cần select: ID, {select_cols}")
         print(f"   📊 Giữ nguyên dữ liệu CLEAN cũ: {original_count} records")
         return mapping
     
@@ -586,6 +618,19 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
         # Cập nhật bảng CLEAN với dữ liệu đã merge
         # ⚠️ QUAN TRỌNG: Chỉ cập nhật bảng CLEAN, KHÔNG động vào bảng gốc
         try:
+            # Kiểm tra schema trước khi ghi
+            print(f"   📝 Schema trước khi ghi: {df_clean_merged.columns}")
+            print(f"   📝 Số records: {clean_count}")
+            
+            # Kiểm tra dữ liệu có NULL không
+            null_counts = {}
+            for col_name in df_clean_merged.columns:
+                null_count = df_clean_merged.filter(col(col_name).isNull()).count()
+                if null_count > 0:
+                    null_counts[col_name] = null_count
+            if null_counts:
+                print(f"   ⚠️ Cảnh báo: Có NULL trong các cột: {null_counts}")
+            
             write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
             
             # ⚠️ QUAN TRỌNG: Verify sau khi ghi - đọc lại để kiểm tra
@@ -595,12 +640,17 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             
             if verify_count == 0:
                 print(f"❌ LỖI: Sau khi ghi, bảng CLEAN bị rỗng! Khôi phục dữ liệu cũ...")
+                print(f"   📝 Schema đã ghi: {df_clean_merged.columns}")
+                print(f"   📝 Schema đã đọc lại: {df_verify.columns if df_verify.count() > 0 else 'Bảng rỗng'}")
                 write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
                 print(f"   ✅ Đã khôi phục {original_count} records")
                 return mapping
             
             if verify_count != clean_count:
                 print(f"⚠️ Cảnh báo: Số records sau khi ghi ({verify_count}) khác với expected ({clean_count})")
+            
+            # Kiểm tra schema sau khi đọc lại
+            print(f"   📝 Schema sau khi đọc lại: {df_verify.columns}")
             
             print(f"✅ Đã cập nhật GOLD_TYPE_DIMENSION_CLEAN: {verify_count} records (từ {original_count} records)")
             print(f"   📝 Đã merge {original_count - verify_count} records trùng")
