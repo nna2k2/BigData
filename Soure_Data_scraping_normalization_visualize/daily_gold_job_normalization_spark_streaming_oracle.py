@@ -420,16 +420,15 @@ def load_dimension_mappings(spark: SparkSession) -> Tuple[Dict, Dict]:
 
 def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict:
     """
-    Gộp các bản ghi trùng trong GOLD_TYPE_DIMENSION_CLEAN và tạo mapping.
-    
-    Logic giống file cũ (pandas): CHỈ tạo mapping, KHÔNG ghi đè bảng CLEAN.
+    Gộp các bản ghi trùng trong GOLD_TYPE_DIMENSION_CLEAN và cập nhật lại bảng CLEAN.
     
     ⚠️ QUAN TRỌNG - TUYỆT ĐỐI KHÔNG ĐỘNG ĐẾN BẢNG GỐC: 
     - ✅ CHỈ đọc từ: GOLD_TYPE_DIMENSION_CLEAN
-    - ✅ CHỈ tạo mapping để dùng cho FACT
+    - ✅ Merge các records trùng trong CLEAN (giữ 1 record cho mỗi group)
+    - ✅ Cập nhật lại bảng CLEAN với dữ liệu đã merge
+    - ✅ Tạo mapping để dùng cho FACT
     - ❌ KHÔNG đọc từ: GOLD_TYPE_DIMENSION (bảng gốc)
     - ❌ KHÔNG ghi vào: GOLD_TYPE_DIMENSION (bảng gốc)
-    - ❌ KHÔNG ghi đè: GOLD_TYPE_DIMENSION_CLEAN (giữ nguyên dữ liệu)
     """
     from decimal import Decimal
     
@@ -513,11 +512,23 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             except (ValueError, TypeError, OverflowError):
                 continue  # Skip nếu không convert được
     
-    # ⚠️ QUAN TRỌNG: Logic giống file cũ (pandas) - CHỈ tạo mapping, KHÔNG ghi đè bảng CLEAN
-    # - Bảng CLEAN đã được tạo/cập nhật ở các bước trước (enrich_gold_types, normalize_purity_format, normalize_category_smart)
-    # - Hàm này CHỈ tạo mapping để dùng cho FACT
-    # - KHÔNG ghi đè bảng CLEAN (giữ nguyên dữ liệu)
-    # - KHÔNG động đến bảng gốc GOLD_TYPE_DIMENSION
+    # Tạo bảng CLEAN mới: merge các records trùng (giữ 1 record cho mỗi CANON_ID)
+    # ⚠️ QUAN TRỌNG: CHỈ xử lý bảng CLEAN, KHÔNG động đến bảng gốc
+    select_cols = ["TYPE_NAME", "PURITY", "CATEGORY"]
+    if "BRAND" in columns:
+        select_cols.append("BRAND")
+    
+    # Lấy giá trị từ canonical record (ID nhỏ nhất) trong mỗi group
+    window_spec_clean = Window.partitionBy("CANON_ID").orderBy("ID")
+    
+    df_clean_merged = df_with_canon.withColumn(
+        "ROW_NUM", row_number().over(window_spec_clean)
+    ).filter(col("ROW_NUM") == 1).select(
+        col("CANON_ID").alias("ID"),
+        *[col(c) for c in select_cols]
+    )
+    
+    clean_count = df_clean_merged.count()
     
     if mapping:
         print(f"✅ Đã tạo mapping cho {len(mapping)} TYPE trùng:")
@@ -526,15 +537,67 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
         if len(mapping) > 5:
             print(f"   ... và {len(mapping) - 5} mapping khác")
         
-        # Tính số records sẽ bị merge (chỉ để log)
-        merged_count = original_count - len(mapping)
-        print(f"   📝 Sẽ merge {len(mapping)} records trùng (từ {original_count} → {merged_count} records)")
-        print(f"   📝 Mapping sẽ được dùng để cập nhật FACT.TYPE_ID trong quá trình xử lý FACT")
-        print(f"   ⚠️ LƯU Ý: Bảng CLEAN KHÔNG được cập nhật, chỉ tạo mapping (giống logic cũ)")
+        # Cập nhật bảng CLEAN với dữ liệu đã merge
+        # ⚠️ QUAN TRỌNG: Chỉ cập nhật bảng CLEAN, KHÔNG động vào bảng gốc
+        write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+        print(f"✅ Đã cập nhật GOLD_TYPE_DIMENSION_CLEAN: {clean_count} records (từ {original_count} records)")
+        print(f"   📝 Đã merge {original_count - clean_count} records trùng")
+        
+        # ⚠️ QUAN TRỌNG: Cập nhật GOLD_PRICE_FACT_CLEAN với mapping
+        # Tất cả records có TYPE_ID = old_id phải đổi thành TYPE_ID = new_id
+        print(f"\n🔄 Đang cập nhật GOLD_PRICE_FACT_CLEAN với type mapping...")
+        try:
+            df_fact_clean = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
+            fact_before_count = df_fact_clean.count()
+            
+            if fact_before_count > 0:
+                # Tạo mapping DataFrame
+                mapping_df = spark.createDataFrame(
+                    [(k, v) for k, v in mapping.items()],
+                    ["OLD_TYPE_ID", "NEW_TYPE_ID"]
+                )
+                
+                # Join và cập nhật TYPE_ID
+                df_fact_updated = df_fact_clean.join(
+                    mapping_df,
+                    df_fact_clean["TYPE_ID"] == mapping_df["OLD_TYPE_ID"],
+                    "left"
+                ).withColumn(
+                    "TYPE_ID",
+                    when(col("NEW_TYPE_ID").isNotNull(), col("NEW_TYPE_ID"))
+                    .otherwise(col("TYPE_ID"))
+                ).drop("OLD_TYPE_ID", "NEW_TYPE_ID")
+                
+                fact_after_count = df_fact_updated.count()
+                
+                # Đếm số records được cập nhật
+                updated_count = df_fact_clean.join(
+                    mapping_df,
+                    df_fact_clean["TYPE_ID"] == mapping_df["OLD_TYPE_ID"],
+                    "inner"
+                ).count()
+                
+                # Ghi lại bảng FACT_CLEAN đã được cập nhật
+                write_table_to_oracle(df_fact_updated, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                print(f"   ✅ Đã cập nhật {updated_count} records trong GOLD_PRICE_FACT_CLEAN")
+                print(f"   📊 GOLD_PRICE_FACT_CLEAN: {fact_before_count} → {fact_after_count} records")
+                
+                # In chi tiết các mapping đã áp dụng
+                for old_id, new_id in mapping.items():
+                    count = df_fact_clean.filter(col("TYPE_ID") == old_id).count()
+                    if count > 0:
+                        print(f"      TYPE_ID {old_id} → {new_id}: {count} records")
+            else:
+                print(f"   ℹ️ GOLD_PRICE_FACT_CLEAN trống, không cần cập nhật")
+        except Exception as e:
+            print(f"   ⚠️ Không thể cập nhật GOLD_PRICE_FACT_CLEAN: {e}")
+            print(f"   📝 Mapping vẫn được trả về để dùng cho FACT mới")
+        
+        print(f"   📝 Mapping sẽ được dùng để cập nhật FACT.TYPE_ID cho dữ liệu mới")
     else:
         print("ℹ️ Không có TYPE trùng cần gộp.")
+        print(f"   📊 Bảng CLEAN giữ nguyên: {original_count} records")
     
-    print(f"✅ Đã gộp {len(mapping)} TYPE trùng. Bảng CLEAN giữ nguyên ({original_count} records).")
     return mapping
 
 def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = False) -> Tuple[Dict, Dict]:
