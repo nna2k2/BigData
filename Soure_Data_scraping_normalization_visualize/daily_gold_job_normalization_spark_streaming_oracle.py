@@ -441,6 +441,10 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
 
     original_count = df.count()
     print(f"📊 Bảng CLEAN hiện có: {original_count} records")
+    
+    # ⚠️ QUAN TRỌNG: Lưu backup dữ liệu CLEAN cũ để restore nếu merge thất bại
+    df_backup = df
+    print(f"   💾 Đã backup {original_count} records để phục hồi nếu cần")
 
     # Kiểm tra các cột có tồn tại không
     columns = df.columns
@@ -518,17 +522,59 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
     if "BRAND" in columns:
         select_cols.append("BRAND")
     
+    print(f"   📝 Các cột sẽ giữ lại: {select_cols}")
+    
     # Lấy giá trị từ canonical record (ID nhỏ nhất) trong mỗi group
     window_spec_clean = Window.partitionBy("CANON_ID").orderBy("ID")
     
+    # Kiểm tra df_with_canon trước khi merge
+    canon_count = df_with_canon.count()
+    print(f"   📊 Số records sau khi tìm CANON_ID: {canon_count}")
+    
     df_clean_merged = df_with_canon.withColumn(
         "ROW_NUM", row_number().over(window_spec_clean)
-    ).filter(col("ROW_NUM") == 1).select(
-        col("CANON_ID").alias("ID"),
-        *[col(c) for c in select_cols]
-    )
+    ).filter(col("ROW_NUM") == 1)
+    
+    # Kiểm tra sau filter
+    after_filter_count = df_clean_merged.count()
+    print(f"   📊 Số records sau filter ROW_NUM=1: {after_filter_count}")
+    
+    # Select các cột cần thiết
+    try:
+        df_clean_merged = df_clean_merged.select(
+            col("CANON_ID").alias("ID"),
+            *[col(c) for c in select_cols]
+        )
+    except Exception as e:
+        print(f"   ❌ Lỗi khi select columns: {e}")
+        print(f"   📝 Các cột có sẵn: {df_with_canon.columns}")
+        print(f"   📝 Các cột cần select: {select_cols}")
+        print(f"   📊 Giữ nguyên dữ liệu CLEAN cũ: {original_count} records")
+        return mapping
     
     clean_count = df_clean_merged.count()
+    print(f"   📊 Số records sau select: {clean_count}")
+    
+    # ⚠️ QUAN TRỌNG: Kiểm tra an toàn trước khi ghi
+    # Nếu df_clean_merged rỗng hoặc mất quá nhiều dữ liệu, restore dữ liệu cũ
+    if clean_count == 0:
+        print(f"❌ LỖI: Sau merge bảng CLEAN rỗng! Khôi phục dữ liệu cũ...")
+        try:
+            write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+            print(f"   ✅ Đã khôi phục {original_count} records")
+        except Exception as restore_error:
+            print(f"   ❌ Lỗi khi khôi phục: {restore_error}")
+        return mapping
+    
+    if clean_count < original_count * 0.5:  # Nếu mất > 50% thì có vấn đề
+        print(f"⚠️ CẢNH BÁO: Sau merge mất quá nhiều dữ liệu ({original_count} → {clean_count})!")
+        print(f"   📊 Khôi phục dữ liệu CLEAN cũ để tránh mất dữ liệu...")
+        try:
+            write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+            print(f"   ✅ Đã khôi phục {original_count} records")
+        except Exception as restore_error:
+            print(f"   ❌ Lỗi khi khôi phục: {restore_error}")
+        return mapping
     
     if mapping:
         print(f"✅ Đã tạo mapping cho {len(mapping)} TYPE trùng:")
@@ -539,9 +585,34 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
         
         # Cập nhật bảng CLEAN với dữ liệu đã merge
         # ⚠️ QUAN TRỌNG: Chỉ cập nhật bảng CLEAN, KHÔNG động vào bảng gốc
-        write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
-        print(f"✅ Đã cập nhật GOLD_TYPE_DIMENSION_CLEAN: {clean_count} records (từ {original_count} records)")
-        print(f"   📝 Đã merge {original_count - clean_count} records trùng")
+        try:
+            write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+            
+            # ⚠️ QUAN TRỌNG: Verify sau khi ghi - đọc lại để kiểm tra
+            spark.catalog.clearCache()
+            df_verify = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
+            verify_count = df_verify.count()
+            
+            if verify_count == 0:
+                print(f"❌ LỖI: Sau khi ghi, bảng CLEAN bị rỗng! Khôi phục dữ liệu cũ...")
+                write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                print(f"   ✅ Đã khôi phục {original_count} records")
+                return mapping
+            
+            if verify_count != clean_count:
+                print(f"⚠️ Cảnh báo: Số records sau khi ghi ({verify_count}) khác với expected ({clean_count})")
+            
+            print(f"✅ Đã cập nhật GOLD_TYPE_DIMENSION_CLEAN: {verify_count} records (từ {original_count} records)")
+            print(f"   📝 Đã merge {original_count - verify_count} records trùng")
+        except Exception as e:
+            print(f"❌ LỖI khi ghi vào bảng CLEAN: {e}")
+            print(f"   📊 Khôi phục dữ liệu CLEAN cũ: {original_count} records...")
+            try:
+                write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                print(f"   ✅ Đã khôi phục {original_count} records")
+            except Exception as restore_error:
+                print(f"   ❌ Lỗi khi khôi phục: {restore_error}")
+            return mapping
         
         # ⚠️ QUAN TRỌNG: Cập nhật GOLD_PRICE_FACT_CLEAN với mapping
         # Tất cả records có TYPE_ID = old_id phải đổi thành TYPE_ID = new_id
@@ -550,6 +621,10 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             df_fact_clean = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
             fact_before_count = df_fact_clean.count()
             
+            # ⚠️ QUAN TRỌNG: Backup dữ liệu FACT_CLEAN trước khi cập nhật
+            df_fact_backup = df_fact_clean
+            print(f"   💾 Đã backup {fact_before_count} records FACT_CLEAN")
+            
             if fact_before_count > 0:
                 # Tạo mapping DataFrame
                 mapping_df = spark.createDataFrame(
@@ -557,40 +632,69 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
                     ["OLD_TYPE_ID", "NEW_TYPE_ID"]
                 )
                 
-                # Join và cập nhật TYPE_ID
+                # Join và cập nhật TYPE_ID (LEFT JOIN để giữ TẤT CẢ records)
                 df_fact_updated = df_fact_clean.join(
                     mapping_df,
                     df_fact_clean["TYPE_ID"] == mapping_df["OLD_TYPE_ID"],
-                    "left"
+                    "left"  # LEFT JOIN để giữ tất cả records, kể cả không có mapping
                 ).withColumn(
                     "TYPE_ID",
                     when(col("NEW_TYPE_ID").isNotNull(), col("NEW_TYPE_ID"))
-                    .otherwise(col("TYPE_ID"))
+                    .otherwise(col("TYPE_ID"))  # Giữ nguyên nếu không có mapping
                 ).drop("OLD_TYPE_ID", "NEW_TYPE_ID")
                 
                 fact_after_count = df_fact_updated.count()
                 
-                # Đếm số records được cập nhật
-                updated_count = df_fact_clean.join(
-                    mapping_df,
-                    df_fact_clean["TYPE_ID"] == mapping_df["OLD_TYPE_ID"],
-                    "inner"
-                ).count()
-                
-                # Ghi lại bảng FACT_CLEAN đã được cập nhật
-                write_table_to_oracle(df_fact_updated, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
-                print(f"   ✅ Đã cập nhật {updated_count} records trong GOLD_PRICE_FACT_CLEAN")
-                print(f"   📊 GOLD_PRICE_FACT_CLEAN: {fact_before_count} → {fact_after_count} records")
-                
-                # In chi tiết các mapping đã áp dụng
-                for old_id, new_id in mapping.items():
-                    count = df_fact_clean.filter(col("TYPE_ID") == old_id).count()
-                    if count > 0:
-                        print(f"      TYPE_ID {old_id} → {new_id}: {count} records")
+                # ⚠️ QUAN TRỌNG: Kiểm tra an toàn - số records phải giữ nguyên
+                if fact_after_count == 0:
+                    print(f"   ❌ LỖI: Sau cập nhật FACT_CLEAN bị rỗng! Khôi phục...")
+                    write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                    print(f"   ✅ Đã khôi phục {fact_before_count} records FACT_CLEAN")
+                elif fact_after_count != fact_before_count:
+                    print(f"   ⚠️ CẢNH BÁO: Số records thay đổi ({fact_before_count} → {fact_after_count})!")
+                    print(f"   📊 Khôi phục dữ liệu FACT_CLEAN cũ...")
+                    write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                    print(f"   ✅ Đã khôi phục {fact_before_count} records FACT_CLEAN")
+                else:
+                    # Đếm số records được cập nhật
+                    updated_count = df_fact_clean.join(
+                        mapping_df,
+                        df_fact_clean["TYPE_ID"] == mapping_df["OLD_TYPE_ID"],
+                        "inner"
+                    ).count()
+                    
+                    # Ghi lại bảng FACT_CLEAN đã được cập nhật
+                    write_table_to_oracle(df_fact_updated, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                    
+                    # Verify sau khi ghi
+                    spark.catalog.clearCache()
+                    df_fact_verify = read_table_from_oracle(spark, "GOLD_PRICE_FACT_CLEAN", DB_USER)
+                    verify_count = df_fact_verify.count()
+                    
+                    if verify_count == 0:
+                        print(f"   ❌ LỖI: Sau khi ghi, FACT_CLEAN bị rỗng! Khôi phục...")
+                        write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                        print(f"   ✅ Đã khôi phục {fact_before_count} records FACT_CLEAN")
+                    else:
+                        print(f"   ✅ Đã cập nhật {updated_count} records trong GOLD_PRICE_FACT_CLEAN")
+                        print(f"   📊 GOLD_PRICE_FACT_CLEAN: {fact_before_count} → {verify_count} records")
+                        
+                        # In chi tiết các mapping đã áp dụng
+                        for old_id, new_id in mapping.items():
+                            count = df_fact_clean.filter(col("TYPE_ID") == old_id).count()
+                            if count > 0:
+                                print(f"      TYPE_ID {old_id} → {new_id}: {count} records")
             else:
                 print(f"   ℹ️ GOLD_PRICE_FACT_CLEAN trống, không cần cập nhật")
         except Exception as e:
-            print(f"   ⚠️ Không thể cập nhật GOLD_PRICE_FACT_CLEAN: {e}")
+            print(f"   ❌ LỖI khi cập nhật GOLD_PRICE_FACT_CLEAN: {e}")
+            print(f"   📊 Khôi phục dữ liệu FACT_CLEAN cũ...")
+            try:
+                if 'df_fact_backup' in locals():
+                    write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                    print(f"   ✅ Đã khôi phục {fact_before_count} records FACT_CLEAN")
+            except Exception as restore_error:
+                print(f"   ❌ Lỗi khi khôi phục FACT_CLEAN: {restore_error}")
             print(f"   📝 Mapping vẫn được trả về để dùng cho FACT mới")
         
         print(f"   📝 Mapping sẽ được dùng để cập nhật FACT.TYPE_ID cho dữ liệu mới")
