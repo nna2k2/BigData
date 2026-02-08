@@ -305,12 +305,47 @@ def update_checkpoint(spark: SparkSession, ts: dt.datetime):
         print(f"   ❌ Lỗi khi cập nhật checkpoint: {e}")
         raise
 
-def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "append"):
+def delete_all_from_oracle_table(spark: SparkSession, table_name: str):
+    """Xóa tất cả dữ liệu từ bảng Oracle bằng SQL JDBC."""
+    try:
+        # Dùng JDBC connection trực tiếp để thực thi DELETE
+        url = f"jdbc:oracle:thin:{DB_USER}/{DB_PASS}@{DB_DSN}"
+        
+        try:
+            import jaydebeapi
+            conn = jaydebeapi.connect("oracle.jdbc.driver.OracleDriver", 
+                                    url, 
+                                    [DB_USER, DB_PASS])
+            cursor = conn.cursor()
+            cursor.execute(f"DELETE FROM {table_name}")
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print(f"   ✅ Đã xóa dữ liệu từ {table_name}")
+        except ImportError:
+            # Nếu không có jaydebeapi, thử dùng cx_Oracle hoặc oracle.connector
+            try:
+                import cx_Oracle
+                conn = cx_Oracle.connect(DB_USER, DB_PASS, DB_DSN)
+                cursor = conn.cursor()
+                cursor.execute(f"DELETE FROM {table_name}")
+                conn.commit()
+                cursor.close()
+                conn.close()
+                print(f"   ✅ Đã xóa dữ liệu từ {table_name} (dùng cx_Oracle)")
+            except ImportError:
+                print(f"   ⚠️ Không có jaydebeapi hoặc cx_Oracle, không thể xóa dữ liệu")
+                raise
+    except Exception as e:
+        print(f"   ⚠️ Không thể xóa dữ liệu từ {table_name}: {e}")
+        raise
+
+def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "append", spark: SparkSession = None):
     """
     Ghi DataFrame vào Oracle DB.
     
     ⚠️ QUAN TRỌNG: 
-    - Khi dùng mode="overwrite", Spark JDBC có thể drop và tạo lại bảng, có thể gây mất dữ liệu.
+    - Khi dùng mode="overwrite", sẽ dùng DELETE + APPEND thay vì overwrite để tránh mất dữ liệu.
     - Đảm bảo DataFrame có đúng schema và không có NULL trong các cột NOT NULL trước khi ghi.
     """
     if df.count() == 0:
@@ -329,6 +364,22 @@ def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "append"
         if null_brand_count > 0:
             print(f"   ⚠️ Có {null_brand_count} records có BRAND = NULL, sẽ fill bằng empty string")
             df = df.withColumn("BRAND", when(col("BRAND").isNull(), lit("")).otherwise(col("BRAND")))
+    
+    # Nếu mode="overwrite", dùng DELETE + APPEND thay vì overwrite
+    if mode == "overwrite":
+        print(f"   🔄 Dùng DELETE + APPEND thay vì OVERWRITE để tránh mất dữ liệu...")
+        if spark is not None:
+            try:
+                # Xóa dữ liệu cũ bằng SQL
+                delete_all_from_oracle_table(spark, table_name)
+                # Sau đó append dữ liệu mới
+                mode = "append"
+            except Exception as delete_error:
+                print(f"   ⚠️ Không thể xóa dữ liệu cũ: {delete_error}")
+                print(f"   📝 Sẽ dùng OVERWRITE (có thể rủi ro)")
+        else:
+            print(f"   ⚠️ Không có SparkSession, không thể xóa dữ liệu cũ")
+            print(f"   📝 Sẽ dùng OVERWRITE (có thể rủi ro)")
     
     try:
         df.write \
@@ -463,9 +514,20 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
     if df.count() == 0:
         print("⚠️ GOLD_TYPE_DIMENSION_CLEAN trống.")
         return {}
-
+    
     original_count = df.count()
     print(f"📊 Bảng CLEAN hiện có: {original_count} records")
+    
+    # ⚠️ QUAN TRỌNG: Fill NULL trong BRAND ngay từ đầu (trước khi xử lý)
+    # Vì Oracle có thể có constraint hoặc Spark JDBC không xử lý NULL đúng cách
+    if "BRAND" in df.columns:
+        null_brand_count = df.filter(col("BRAND").isNull()).count()
+        if null_brand_count > 0:
+            print(f"   ⚠️ Có {null_brand_count} records có BRAND = NULL, sẽ fill bằng empty string ngay từ đầu")
+            df = df.withColumn(
+                "BRAND", 
+                when(col("BRAND").isNull(), lit("")).otherwise(col("BRAND"))
+            )
     
     # ⚠️ QUAN TRỌNG: Lưu backup dữ liệu CLEAN cũ để restore nếu merge thất bại
     df_backup = df
@@ -576,11 +638,32 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             print(f"   📊 Giữ nguyên dữ liệu CLEAN cũ: {original_count} records")
             return mapping
         
+        # ⚠️ QUAN TRỌNG: Đảm bảo BRAND không NULL trước khi select
+        # Vì sau khi select có thể mất logic fill NULL
+        if "BRAND" in df_clean_merged.columns:
+            null_brand_count = df_clean_merged.filter(col("BRAND").isNull()).count()
+            if null_brand_count > 0:
+                print(f"   ⚠️ Có {null_brand_count} records có BRAND = NULL trước khi select, sẽ fill bằng empty string")
+                df_clean_merged = df_clean_merged.withColumn(
+                    "BRAND", 
+                    when(col("BRAND").isNull(), lit("")).otherwise(col("BRAND"))
+                )
+        
         # Select với thứ tự đúng: ID trước, sau đó các cột khác
         df_clean_merged = df_clean_merged.select(
             col("CANON_ID").alias("ID"),
             *[col(c) for c in select_cols]
         )
+        
+        # ⚠️ QUAN TRỌNG: Đảm bảo BRAND không NULL sau khi select
+        if "BRAND" in df_clean_merged.columns:
+            null_brand_count = df_clean_merged.filter(col("BRAND").isNull()).count()
+            if null_brand_count > 0:
+                print(f"   ⚠️ Có {null_brand_count} records có BRAND = NULL sau khi select, sẽ fill bằng empty string")
+                df_clean_merged = df_clean_merged.withColumn(
+                    "BRAND", 
+                    when(col("BRAND").isNull(), lit("")).otherwise(col("BRAND"))
+                )
         
         # Kiểm tra schema sau khi select
         print(f"   📝 Schema sau select: {df_clean_merged.columns}")
@@ -652,7 +735,7 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             if null_counts:
                 print(f"   ⚠️ Cảnh báo: Vẫn còn NULL trong các cột: {null_counts}")
             
-            write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+            write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite", spark)
             
             # ⚠️ QUAN TRỌNG: Verify sau khi ghi - đọc lại để kiểm tra
             spark.catalog.clearCache()
@@ -663,7 +746,7 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
                 print(f"❌ LỖI: Sau khi ghi, bảng CLEAN bị rỗng! Khôi phục dữ liệu cũ...")
                 print(f"   📝 Schema đã ghi: {df_clean_merged.columns}")
                 print(f"   📝 Schema đã đọc lại: {df_verify.columns if df_verify.count() > 0 else 'Bảng rỗng'}")
-                write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite", spark)
                 print(f"   ✅ Đã khôi phục {original_count} records")
                 return mapping
             
@@ -679,7 +762,7 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             print(f"❌ LỖI khi ghi vào bảng CLEAN: {e}")
             print(f"   📊 Khôi phục dữ liệu CLEAN cũ: {original_count} records...")
             try:
-                write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite", spark)
                 print(f"   ✅ Đã khôi phục {original_count} records")
             except Exception as restore_error:
                 print(f"   ❌ Lỗi khi khôi phục: {restore_error}")
@@ -719,12 +802,12 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
                 # ⚠️ QUAN TRỌNG: Kiểm tra an toàn - số records phải giữ nguyên
                 if fact_after_count == 0:
                     print(f"   ❌ LỖI: Sau cập nhật FACT_CLEAN bị rỗng! Khôi phục...")
-                    write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                    write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite", spark)
                     print(f"   ✅ Đã khôi phục {fact_before_count} records FACT_CLEAN")
                 elif fact_after_count != fact_before_count:
                     print(f"   ⚠️ CẢNH BÁO: Số records thay đổi ({fact_before_count} → {fact_after_count})!")
                     print(f"   📊 Khôi phục dữ liệu FACT_CLEAN cũ...")
-                    write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                    write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite", spark)
                     print(f"   ✅ Đã khôi phục {fact_before_count} records FACT_CLEAN")
                 else:
                     # Đếm số records được cập nhật
@@ -735,7 +818,7 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
                     ).count()
                     
                     # Ghi lại bảng FACT_CLEAN đã được cập nhật
-                    write_table_to_oracle(df_fact_updated, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                    write_table_to_oracle(df_fact_updated, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite", spark)
                     
                     # Verify sau khi ghi
                     spark.catalog.clearCache()
@@ -744,7 +827,7 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
                     
                     if verify_count == 0:
                         print(f"   ❌ LỖI: Sau khi ghi, FACT_CLEAN bị rỗng! Khôi phục...")
-                        write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                        write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite", spark)
                         print(f"   ✅ Đã khôi phục {fact_before_count} records FACT_CLEAN")
                     else:
                         print(f"   ✅ Đã cập nhật {updated_count} records trong GOLD_PRICE_FACT_CLEAN")
@@ -762,7 +845,7 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             print(f"   📊 Khôi phục dữ liệu FACT_CLEAN cũ...")
             try:
                 if 'df_fact_backup' in locals():
-                    write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
+                    write_table_to_oracle(df_fact_backup, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite", spark)
                     print(f"   ✅ Đã khôi phục {fact_before_count} records FACT_CLEAN")
             except Exception as restore_error:
                 print(f"   ❌ Lỗi khi khôi phục FACT_CLEAN: {restore_error}")
