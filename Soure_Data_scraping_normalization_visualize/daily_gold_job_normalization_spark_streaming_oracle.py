@@ -309,8 +309,9 @@ def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "append"
     """
     Ghi DataFrame vào Oracle DB.
     
-    ⚠️ QUAN TRỌNG: Khi dùng mode="overwrite", Spark JDBC có thể drop và tạo lại bảng.
-    Đảm bảo DataFrame có đúng schema và thứ tự cột trước khi ghi.
+    ⚠️ QUAN TRỌNG: 
+    - Khi dùng mode="overwrite", Spark JDBC có thể drop và tạo lại bảng, có thể gây mất dữ liệu.
+    - Đảm bảo DataFrame có đúng schema và không có NULL trong các cột NOT NULL trước khi ghi.
     """
     if df.count() == 0:
         print(f"   ⚠️ DataFrame rỗng, không ghi vào {table_name}")
@@ -320,6 +321,14 @@ def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "append"
     print(f"   📝 Ghi vào {table_name} với mode={mode}")
     print(f"   📝 Schema: {df.columns}")
     print(f"   📝 Số records: {df.count()}")
+    
+    # ⚠️ QUAN TRỌNG: Đảm bảo BRAND không NULL (fill với empty string nếu NULL)
+    # Vì Oracle có thể có constraint hoặc Spark JDBC không xử lý NULL đúng cách
+    if "BRAND" in df.columns:
+        null_brand_count = df.filter(col("BRAND").isNull()).count()
+        if null_brand_count > 0:
+            print(f"   ⚠️ Có {null_brand_count} records có BRAND = NULL, sẽ fill bằng empty string")
+            df = df.withColumn("BRAND", when(col("BRAND").isNull(), lit("")).otherwise(col("BRAND")))
     
     try:
         df.write \
@@ -622,14 +631,26 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             print(f"   📝 Schema trước khi ghi: {df_clean_merged.columns}")
             print(f"   📝 Số records: {clean_count}")
             
-            # Kiểm tra dữ liệu có NULL không
+            # ⚠️ QUAN TRỌNG: Đảm bảo BRAND không NULL (fill với empty string nếu NULL)
+            # Vì Oracle có thể có constraint hoặc Spark JDBC không xử lý NULL đúng cách
+            if "BRAND" in df_clean_merged.columns:
+                null_brand_count = df_clean_merged.filter(col("BRAND").isNull()).count()
+                if null_brand_count > 0:
+                    print(f"   ⚠️ Có {null_brand_count} records có BRAND = NULL, sẽ fill bằng empty string")
+                    df_clean_merged = df_clean_merged.withColumn(
+                        "BRAND", 
+                        when(col("BRAND").isNull(), lit("")).otherwise(col("BRAND"))
+                    )
+            
+            # Kiểm tra dữ liệu có NULL không (sau khi fill)
             null_counts = {}
             for col_name in df_clean_merged.columns:
-                null_count = df_clean_merged.filter(col(col_name).isNull()).count()
-                if null_count > 0:
-                    null_counts[col_name] = null_count
+                if col_name != "ID":  # ID có thể NULL trong một số trường hợp
+                    null_count = df_clean_merged.filter(col(col_name).isNull()).count()
+                    if null_count > 0:
+                        null_counts[col_name] = null_count
             if null_counts:
-                print(f"   ⚠️ Cảnh báo: Có NULL trong các cột: {null_counts}")
+                print(f"   ⚠️ Cảnh báo: Vẫn còn NULL trong các cột: {null_counts}")
             
             write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
             
