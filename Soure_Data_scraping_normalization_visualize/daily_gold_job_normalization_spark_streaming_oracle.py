@@ -149,17 +149,34 @@ def read_new_data_from_oracle(spark: SparkSession, table_name: str,
                               timestamp_column: str = TIMESTAMP_COLUMN) -> 'DataFrame':
     """
     Đọc chỉ dữ liệu MỚI từ Oracle dựa trên timestamp.
+    
+    Logic:
+    - Query: WHERE RECORDED_AT > last_timestamp
+    - Chỉ lấy dữ liệu sau timestamp cuối cùng đã xử lý
+    - ORDER BY timestamp để đảm bảo thứ tự
+    
+    Args:
+        spark: SparkSession
+        table_name: Tên bảng Oracle
+        last_timestamp: Timestamp cuối cùng đã xử lý
+        timestamp_column: Tên cột timestamp (mặc định: RECORDED_AT)
+    
+    Returns:
+        DataFrame: Dữ liệu mới sau last_timestamp
     """
     schema_prefix = f'"{DB_USER}"."'
     full_table = f'{schema_prefix}{table_name}"'
     
     # Tạo query để chỉ lấy dữ liệu mới
+    # Dùng > (lớn hơn) để tránh lấy lại record đã xử lý
     ts_str = last_timestamp.strftime('%Y-%m-%d %H:%M:%S')
     query = f"""
         (SELECT * FROM {full_table}
          WHERE {timestamp_column} > TO_TIMESTAMP('{ts_str}', 'YYYY-MM-DD HH24:MI:SS')
          ORDER BY {timestamp_column})
     """
+    
+    print(f"   🔍 Query: WHERE {timestamp_column} > '{ts_str}'")
     
     try:
         df = spark.read \
@@ -168,13 +185,34 @@ def read_new_data_from_oracle(spark: SparkSession, table_name: str,
             .option("dbtable", query) \
             .option("driver", "oracle.jdbc.driver.OracleDriver") \
             .load()
+        
+        count = df.count()
+        if count > 0:
+            # Lấy min và max timestamp để log
+            min_ts = df.agg(spark_min(col(timestamp_column))).first()[0]
+            max_ts = df.agg(spark_max(col(timestamp_column))).first()[0]
+            print(f"   ✅ Tìm thấy {count} records mới (từ {min_ts} đến {max_ts})")
+        else:
+            print(f"   ℹ️ Không có dữ liệu mới sau {ts_str}")
+        
         return df
     except Exception as e:
-        print(f"⚠️ Lỗi khi đọc dữ liệu mới: {e}")
+        print(f"   ⚠️ Lỗi khi đọc dữ liệu mới: {e}")
+        print(f"   📝 Trả về DataFrame rỗng")
         return spark.createDataFrame([], get_fact_schema())
 
 def get_last_timestamp_from_checkpoint(spark: SparkSession) -> dt.datetime:
-    """Lấy timestamp cuối cùng từ checkpoint."""
+    """
+    Lấy timestamp cuối cùng từ checkpoint.
+    
+    Logic:
+    1. Đọc từ bảng ETL_CHECKPOINT với JOB_NAME
+    2. Nếu không có, lấy max timestamp từ GOLD_PRICE_FACT
+    3. Nếu vẫn không có, dùng 2000-01-01 làm mặc định
+    
+    Returns:
+        dt.datetime: Timestamp cuối cùng đã xử lý
+    """
     try:
         df = read_table_from_oracle(spark, "ETL_CHECKPOINT", DB_USER)
         df_checkpoint = df.filter(col("JOB_NAME") == JOB_NAME)
@@ -182,9 +220,16 @@ def get_last_timestamp_from_checkpoint(spark: SparkSession) -> dt.datetime:
         if df_checkpoint.count() > 0:
             last_run = df_checkpoint.select("LAST_RUN").first()
             if last_run and last_run[0]:
-                return last_run[0]
+                last_ts = last_run[0]
+                print(f"📌 Checkpoint tìm thấy: {last_ts}")
+                return last_ts
+            else:
+                print("⚠️ Checkpoint có record nhưng LAST_RUN là NULL")
+        else:
+            print("ℹ️ Chưa có checkpoint trong ETL_CHECKPOINT, đang tìm trong FACT...")
     except Exception as e:
         print(f"⚠️ Không đọc được checkpoint: {e}")
+        print("   Đang fallback sang FACT table...")
     
     # Nếu chưa có checkpoint, lấy timestamp từ bảng FACT
     try:
@@ -192,32 +237,73 @@ def get_last_timestamp_from_checkpoint(spark: SparkSession) -> dt.datetime:
         if df_fact.count() > 0:
             max_ts = df_fact.agg(spark_max(col(TIMESTAMP_COLUMN))).first()[0]
             if max_ts:
+                print(f"📌 Lấy max timestamp từ FACT: {max_ts}")
                 return max_ts
+            else:
+                print("⚠️ FACT có dữ liệu nhưng không có timestamp hợp lệ")
+        else:
+            print("ℹ️ FACT table trống")
     except Exception as e:
         print(f"⚠️ Không lấy được timestamp từ FACT: {e}")
     
-    return dt.datetime(2000, 1, 1)
+    default_ts = dt.datetime(2000, 1, 1)
+    print(f"📌 Sử dụng timestamp mặc định: {default_ts}")
+    return default_ts
 
 def update_checkpoint(spark: SparkSession, ts: dt.datetime):
-    """Cập nhật checkpoint."""
+    """
+    Cập nhật checkpoint với timestamp mới nhất.
+    
+    Logic:
+    1. Đọc tất cả records từ ETL_CHECKPOINT
+    2. Filter ra record của job khác (giữ lại)
+    3. Union với record mới của job này
+    4. Overwrite toàn bộ bảng (có thể cải thiện bằng MERGE/UPDATE)
+    
+    Args:
+        spark: SparkSession
+        ts: Timestamp mới nhất đã xử lý
+    """
+    print(f"💾 Đang cập nhật checkpoint với timestamp: {ts}")
+    
     checkpoint_df = spark.createDataFrame(
         [(JOB_NAME, ts)],
         ["JOB_NAME", "LAST_RUN"]
     )
     
     try:
+        # Đọc tất cả records hiện có
         existing = read_table_from_oracle(spark, "ETL_CHECKPOINT", DB_USER)
-        combined = existing.filter(col("JOB_NAME") != JOB_NAME).union(checkpoint_df)
-    except:
+        existing_count = existing.count()
+        print(f"   📊 Records hiện có trong checkpoint: {existing_count}")
+        
+        # Giữ lại records của job khác, thêm/update record của job này
+        other_jobs = existing.filter(col("JOB_NAME") != JOB_NAME)
+        other_count = other_jobs.count()
+        print(f"   📊 Records của job khác: {other_count}")
+        
+        combined = other_jobs.union(checkpoint_df)
+        combined_count = combined.count()
+        print(f"   📊 Tổng records sau merge: {combined_count}")
+        
+    except Exception as e:
+        print(f"   ⚠️ Không đọc được checkpoint hiện có: {e}")
+        print(f"   📝 Sẽ tạo checkpoint mới")
         combined = checkpoint_df
     
-    combined.write \
-        .format("jdbc") \
-        .option("url", f"jdbc:oracle:thin:{DB_USER}/{DB_PASS}@{DB_DSN}") \
-        .option("dbtable", f"{DB_USER}.ETL_CHECKPOINT") \
-        .option("driver", "oracle.jdbc.driver.OracleDriver") \
-        .mode("overwrite") \
-        .save()
+    # Ghi lại toàn bộ bảng (có thể cải thiện bằng MERGE/UPDATE trong tương lai)
+    try:
+        combined.write \
+            .format("jdbc") \
+            .option("url", f"jdbc:oracle:thin:{DB_USER}/{DB_PASS}@{DB_DSN}") \
+            .option("dbtable", f"{DB_USER}.ETL_CHECKPOINT") \
+            .option("driver", "oracle.jdbc.driver.OracleDriver") \
+            .mode("overwrite") \
+            .save()
+        print(f"   ✅ Đã cập nhật checkpoint thành công")
+    except Exception as e:
+        print(f"   ❌ Lỗi khi cập nhật checkpoint: {e}")
+        raise
 
 def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "append"):
     """Ghi DataFrame vào Oracle DB."""
@@ -561,15 +647,21 @@ def process_batch(batch_id: int, batch_df: 'DataFrame',
     print(f"{'='*60}")
     
     # Bỏ qua batch_df (không dùng, chỉ là trigger)
-    # Đọc dữ liệu mới từ Oracle
+    # Đọc dữ liệu mới từ Oracle dựa trên checkpoint
+    print(f"\n🔍 Bước 1: Lấy checkpoint để phát hiện dữ liệu mới...")
     last_ts = get_last_timestamp_from_checkpoint(spark)
-    print(f"🔍 Đang kiểm tra dữ liệu mới sau {last_ts}...")
+    print(f"   📌 Timestamp checkpoint: {last_ts}")
     
+    print(f"\n🔍 Bước 2: Đọc dữ liệu mới sau checkpoint...")
     df_new = read_new_data_from_oracle(spark, table_name, last_ts)
     
-    if df_new.count() == 0:
-        print("ℹ️ Không có dữ liệu mới trong batch này")
+    new_count = df_new.count()
+    if new_count == 0:
+        print(f"\nℹ️ Không có dữ liệu mới trong batch này (sau {last_ts})")
+        print(f"   ⏭️  Bỏ qua batch {batch_id}")
         return
+    
+    print(f"\n✅ Phát hiện {new_count} records mới cần xử lý")
     
     print(f"📊 Số lượng records FACT mới: {df_new.count()}")
     
@@ -701,11 +793,15 @@ def process_batch(batch_id: int, batch_df: 'DataFrame',
         write_table_to_oracle(df_combined, f"{DB_USER}.GOLD_PRICE_FACT_CLEAN", "overwrite")
         print(f"✅ Đã merge và clean: {final_count} records (thêm {processed_count} mới, giữ {existing_count} cũ)")
         
-        # Cập nhật checkpoint với timestamp mới nhất
+        # Cập nhật checkpoint với timestamp mới nhất từ dữ liệu đã xử lý
+        print(f"\n💾 Bước cuối: Cập nhật checkpoint...")
         max_ts = df_processed.agg(spark_max(col(TIMESTAMP_COLUMN))).first()[0]
         if max_ts:
             update_checkpoint(spark, max_ts)
-            print(f"✅ Đã cập nhật checkpoint: {max_ts}")
+            print(f"✅ Checkpoint đã được cập nhật: {max_ts}")
+            print(f"   📌 Batch tiếp theo sẽ xử lý dữ liệu sau {max_ts}")
+        else:
+            print(f"⚠️ Không có timestamp hợp lệ để cập nhật checkpoint")
     
     except Exception as e:
         # Nếu bảng CLEAN chưa có, ghi dữ liệu mới (chỉ lần đầu)
