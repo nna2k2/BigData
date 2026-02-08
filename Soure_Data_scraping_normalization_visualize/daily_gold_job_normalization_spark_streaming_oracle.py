@@ -712,13 +712,21 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
     print(f"   📝 Các cột sẽ giữ lại: {select_cols}")
     print(f"   📝 Các cột có sẵn trong df_with_canon: {df_with_canon.columns}")
     
-    # Lấy giá trị từ canonical record (ID nhỏ nhất) trong mỗi group
+    # ⚠️ QUAN TRỌNG: Lấy 1 record cho mỗi CANON_ID (group trùng)
+    # Logic: Mỗi CANON_ID đại diện cho 1 group records trùng
+    # Chỉ cần giữ 1 record cho mỗi CANON_ID (record có ID nhỏ nhất)
     window_spec_clean = Window.partitionBy("CANON_ID").orderBy("ID")
     
     # Kiểm tra df_with_canon trước khi merge
     canon_count = df_with_canon.count()
     print(f"   📊 Số records sau khi tìm CANON_ID: {canon_count}")
     
+    # Đếm số CANON_ID unique (số groups)
+    unique_canon_ids = df_with_canon.select("CANON_ID").distinct().count()
+    print(f"   📊 Số CANON_ID unique (số groups): {unique_canon_ids}")
+    print(f"   📊 Số records sẽ bị merge: {canon_count - unique_canon_ids}")
+    
+    # Lấy 1 record cho mỗi CANON_ID (record có ID nhỏ nhất trong group)
     df_clean_merged = df_with_canon.withColumn(
         "ROW_NUM", row_number().over(window_spec_clean)
     ).filter(col("ROW_NUM") == 1)
@@ -828,6 +836,25 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
         # Cập nhật bảng CLEAN với dữ liệu đã merge
         # ⚠️ QUAN TRỌNG: Chỉ cập nhật bảng CLEAN, KHÔNG động vào bảng gốc
         try:
+            # ⚠️ QUAN TRỌNG: Đọc schema từ bảng hiện tại để đảm bảo khớp
+            try:
+                existing_schema_df = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
+                existing_schema = existing_schema_df.columns
+                existing_schema_count = existing_schema_df.count()
+                print(f"   📝 Schema hiện tại trong DB: {existing_schema}")
+                print(f"   📝 Số records hiện tại trong DB: {existing_schema_count}")
+                
+                # So sánh schema
+                new_schema = df_clean_merged.columns
+                if set(existing_schema) != set(new_schema):
+                    print(f"   ⚠️ CẢNH BÁO: Schema không khớp!")
+                    print(f"      DB: {existing_schema}")
+                    print(f"      Mới: {new_schema}")
+                    print(f"      Thiếu: {set(existing_schema) - set(new_schema)}")
+                    print(f"      Thừa: {set(new_schema) - set(existing_schema)}")
+            except Exception as schema_error:
+                print(f"   ⚠️ Không thể đọc schema từ DB: {schema_error}")
+            
             # Kiểm tra schema trước khi ghi
             print(f"   📝 Schema trước khi ghi: {df_clean_merged.columns}")
             print(f"   📝 Số records: {clean_count}")
@@ -853,33 +880,64 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             if null_counts:
                 print(f"   ⚠️ Cảnh báo: Vẫn còn NULL trong các cột: {null_counts}")
             
+            # ⚠️ QUAN TRỌNG: Verify dữ liệu trước khi ghi
+            print(f"   📊 Kiểm tra dữ liệu trước khi ghi:")
+            print(f"      - Số records: {clean_count}")
+            print(f"      - Schema: {df_clean_merged.columns}")
+            print(f"      - Sample data (5 records đầu):")
+            try:
+                sample = df_clean_merged.limit(5).collect()
+                for i, row in enumerate(sample, 1):
+                    print(f"         {i}. ID={row['ID']}, TYPE_NAME={row.get('TYPE_NAME', 'N/A')[:30]}")
+            except Exception as e:
+                print(f"         ⚠️ Không thể lấy sample: {e}")
+            
             # ⚠️ THỬ NGHIỆM: Không truyền spark parameter để dùng logic giống GOLD_PRICE_FACT_CLEAN
             # GOLD_PRICE_FACT_CLEAN hoạt động bình thường với overwrite không có spark parameter
-            # Có thể vấn đề là ở logic DELETE + APPEND mới
             print(f"   🔄 Dùng OVERWRITE trực tiếp (giống GOLD_PRICE_FACT_CLEAN)...")
-            write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
             
-            # ⚠️ QUAN TRỌNG: Verify sau khi ghi - đọc lại để kiểm tra
-            spark.catalog.clearCache()
-            df_verify = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
-            verify_count = df_verify.count()
-            
-            if verify_count == 0:
-                print(f"❌ LỖI: Sau khi ghi, bảng CLEAN bị rỗng! Khôi phục dữ liệu cũ...")
-                print(f"   📝 Schema đã ghi: {df_clean_merged.columns}")
-                print(f"   📝 Schema đã đọc lại: {df_verify.columns if df_verify.count() > 0 else 'Bảng rỗng'}")
-                write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite", spark)
-                print(f"   ✅ Đã khôi phục {original_count} records")
+            try:
+                write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                
+                # ⚠️ QUAN TRỌNG: Verify sau khi ghi - đọc lại để kiểm tra
+                spark.catalog.clearCache()
+                df_verify = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
+                verify_count = df_verify.count()
+                
+                if verify_count == 0:
+                    print(f"❌ LỖI: Sau khi ghi, bảng CLEAN bị rỗng! Khôi phục dữ liệu cũ...")
+                    print(f"   📝 Schema đã ghi: {df_clean_merged.columns}")
+                    print(f"   📝 Schema đã đọc lại: {df_verify.columns if df_verify.count() > 0 else 'Bảng rỗng'}")
+                    print(f"   📝 Số records đã ghi: {clean_count}")
+                    print(f"   📝 Sample dữ liệu đã ghi (3 records đầu):")
+                    try:
+                        sample_written = df_clean_merged.limit(3).collect()
+                        for i, row in enumerate(sample_written, 1):
+                            print(f"      {i}. ID={row['ID']}, TYPE_NAME={row.get('TYPE_NAME', 'N/A')[:30]}")
+                    except:
+                        pass
+                    write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                    print(f"   ✅ Đã khôi phục {original_count} records")
+                    return mapping
+                
+                if verify_count != clean_count:
+                    print(f"⚠️ Cảnh báo: Số records sau khi ghi ({verify_count}) khác với expected ({clean_count})")
+                    print(f"   📊 Chênh lệch: {abs(verify_count - clean_count)} records")
+                
+                # Kiểm tra schema sau khi đọc lại
+                print(f"   📝 Schema sau khi đọc lại: {df_verify.columns}")
+                
+                print(f"✅ Đã cập nhật GOLD_TYPE_DIMENSION_CLEAN: {verify_count} records (từ {original_count} records)")
+                print(f"   📝 Đã merge {original_count - verify_count} records trùng")
+            except Exception as write_error:
+                print(f"❌ LỖI khi ghi vào bảng CLEAN: {write_error}")
+                print(f"   📊 Khôi phục dữ liệu CLEAN cũ...")
+                try:
+                    write_table_to_oracle(df_backup, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                    print(f"   ✅ Đã khôi phục {original_count} records")
+                except Exception as restore_error:
+                    print(f"   ❌ Lỗi khi khôi phục: {restore_error}")
                 return mapping
-            
-            if verify_count != clean_count:
-                print(f"⚠️ Cảnh báo: Số records sau khi ghi ({verify_count}) khác với expected ({clean_count})")
-            
-            # Kiểm tra schema sau khi đọc lại
-            print(f"   📝 Schema sau khi đọc lại: {df_verify.columns}")
-            
-            print(f"✅ Đã cập nhật GOLD_TYPE_DIMENSION_CLEAN: {verify_count} records (từ {original_count} records)")
-            print(f"   📝 Đã merge {original_count - verify_count} records trùng")
         except Exception as e:
             print(f"❌ LỖI khi ghi vào bảng CLEAN: {e}")
             print(f"   📊 Khôi phục dữ liệu CLEAN cũ: {original_count} records...")
