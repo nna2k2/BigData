@@ -418,6 +418,125 @@ def load_dimension_mappings(spark: SparkSession) -> Tuple[Dict, Dict]:
 
 # ==================== STREAMING WITH FOREACHBATCH ====================
 
+def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict:
+    """
+    Gộp các bản ghi trùng trong GOLD_TYPE_DIMENSION_CLEAN và tạo mapping.
+    
+    Logic giống file cũ (pandas): CHỈ tạo mapping, KHÔNG ghi đè bảng CLEAN.
+    
+    ⚠️ QUAN TRỌNG - TUYỆT ĐỐI KHÔNG ĐỘNG ĐẾN BẢNG GỐC: 
+    - ✅ CHỈ đọc từ: GOLD_TYPE_DIMENSION_CLEAN
+    - ✅ CHỈ tạo mapping để dùng cho FACT
+    - ❌ KHÔNG đọc từ: GOLD_TYPE_DIMENSION (bảng gốc)
+    - ❌ KHÔNG ghi vào: GOLD_TYPE_DIMENSION (bảng gốc)
+    - ❌ KHÔNG ghi đè: GOLD_TYPE_DIMENSION_CLEAN (giữ nguyên dữ liệu)
+    """
+    from decimal import Decimal
+    
+    # ⚠️ QUAN TRỌNG: CHỈ đọc từ bảng CLEAN, KHÔNG đọc từ bảng gốc GOLD_TYPE_DIMENSION
+    df = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION_CLEAN", DB_USER)
+    
+    if df.count() == 0:
+        print("⚠️ GOLD_TYPE_DIMENSION_CLEAN trống.")
+        return {}
+
+    original_count = df.count()
+    print(f"📊 Bảng CLEAN hiện có: {original_count} records")
+
+    # Kiểm tra các cột có tồn tại không
+    columns = df.columns
+    df_normalized = df.withColumn(
+        "TYPE_NAME_NORM", lower(trim(col("TYPE_NAME")))
+    ).withColumn(
+        "PURITY_NORM", lower(trim(col("PURITY")))
+    ).withColumn(
+        "CATEGORY_NORM", lower(trim(col("CATEGORY")))
+    )
+    
+    # Chỉ thêm BRAND_NORM nếu cột BRAND tồn tại
+    if "BRAND" in columns:
+        df_normalized = df_normalized.withColumn(
+            "BRAND_NORM", lower(trim(col("BRAND")))
+        )
+        partition_cols = ["TYPE_NAME_NORM", "PURITY_NORM", "CATEGORY_NORM", "BRAND_NORM"]
+    else:
+        # Tạo cột BRAND_NORM rỗng nếu không có BRAND
+        df_normalized = df_normalized.withColumn("BRAND_NORM", lit(""))
+        partition_cols = ["TYPE_NAME_NORM", "PURITY_NORM", "CATEGORY_NORM", "BRAND_NORM"]
+        print("⚠️ Cột BRAND không tồn tại, sử dụng giá trị rỗng cho BRAND_NORM")
+
+    # Group by normalized values and find canonical ID (ID nhỏ nhất trong mỗi group)
+    window_spec = Window.partitionBy(*partition_cols).orderBy("ID")
+    
+    df_with_canon = df_normalized.withColumn(
+        "CANON_ID",
+        first("ID").over(window_spec)
+    )
+
+    # Create mapping: old_id -> new_id (canonical_id)
+    mapping_df = df_with_canon.filter(col("ID") != col("CANON_ID")) \
+        .select(col("ID").alias("OLD_ID"), col("CANON_ID").alias("NEW_ID")) \
+        .distinct()
+    
+    mapping = {}
+    if mapping_df.count() > 0:
+        for row in mapping_df.collect():
+            # Xử lý OLD_ID và NEW_ID - có thể là Decimal, float, int, hoặc NaN
+            old_id_val = row["OLD_ID"]
+            new_id_val = row["NEW_ID"]
+            
+            # Skip nếu có giá trị None hoặc NaN
+            if old_id_val is None or new_id_val is None:
+                continue
+            try:
+                # Convert OLD_ID
+                if isinstance(old_id_val, int):
+                    old_id = old_id_val
+                elif isinstance(old_id_val, (float, Decimal)):
+                    if pd.isna(old_id_val):
+                        continue
+                    old_id = int(old_id_val)
+                else:
+                    old_id = int(float(str(old_id_val)))
+                
+                # Convert NEW_ID
+                if isinstance(new_id_val, int):
+                    new_id = new_id_val
+                elif isinstance(new_id_val, (float, Decimal)):
+                    if pd.isna(new_id_val):
+                        continue
+                    new_id = int(new_id_val)
+                else:
+                    new_id = int(float(str(new_id_val)))
+                
+                mapping[old_id] = new_id
+            except (ValueError, TypeError, OverflowError):
+                continue  # Skip nếu không convert được
+    
+    # ⚠️ QUAN TRỌNG: Logic giống file cũ (pandas) - CHỈ tạo mapping, KHÔNG ghi đè bảng CLEAN
+    # - Bảng CLEAN đã được tạo/cập nhật ở các bước trước (enrich_gold_types, normalize_purity_format, normalize_category_smart)
+    # - Hàm này CHỈ tạo mapping để dùng cho FACT
+    # - KHÔNG ghi đè bảng CLEAN (giữ nguyên dữ liệu)
+    # - KHÔNG động đến bảng gốc GOLD_TYPE_DIMENSION
+    
+    if mapping:
+        print(f"✅ Đã tạo mapping cho {len(mapping)} TYPE trùng:")
+        for old_id, new_id in list(mapping.items())[:5]:  # In 5 mapping đầu
+            print(f"   ID {old_id} → ID {new_id}")
+        if len(mapping) > 5:
+            print(f"   ... và {len(mapping) - 5} mapping khác")
+        
+        # Tính số records sẽ bị merge (chỉ để log)
+        merged_count = original_count - len(mapping)
+        print(f"   📝 Sẽ merge {len(mapping)} records trùng (từ {original_count} → {merged_count} records)")
+        print(f"   📝 Mapping sẽ được dùng để cập nhật FACT.TYPE_ID trong quá trình xử lý FACT")
+        print(f"   ⚠️ LƯU Ý: Bảng CLEAN KHÔNG được cập nhật, chỉ tạo mapping (giống logic cũ)")
+    else:
+        print("ℹ️ Không có TYPE trùng cần gộp.")
+    
+    print(f"✅ Đã gộp {len(mapping)} TYPE trùng. Bảng CLEAN giữ nguyên ({original_count} records).")
+    return mapping
+
 def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = False) -> Tuple[Dict, Dict]:
     """
     Clean tất cả dimension tables (LOCATION và TYPE) - INCREMENTAL.
@@ -584,14 +703,16 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
                 print(f"✅ Đã tạo GOLD_TYPE_DIMENSION_CLEAN: {new_type_count} records")
             else:
                 print("⚠️ Bảng CLEAN mới rỗng! Kiểm tra lại bảng gốc...")
-                # Fallback: đọc từ bảng gốc
+                # Fallback: CHỈ đọc từ bảng gốc để copy vào CLEAN (KHÔNG sửa bảng gốc)
+                # Đây là trường hợp đặc biệt khi CLEAN bị rỗng, cần copy từ gốc để khôi phục
                 try:
                     df_original = read_table_from_oracle(spark, "GOLD_TYPE_DIMENSION", DB_USER)
                     original_count = df_original.count()
                     if original_count > 0:
-                        print(f"⚠️ Copy {original_count} records từ bảng gốc...")
+                        print(f"⚠️ Copy {original_count} records từ bảng gốc vào CLEAN...")
+                        # QUAN TRỌNG: Chỉ ghi vào CLEAN, KHÔNG động vào bảng gốc
                         write_table_to_oracle(df_original, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
-                        print(f"✅ Đã copy từ bảng gốc: {original_count} records")
+                        print(f"✅ Đã copy từ bảng gốc vào CLEAN: {original_count} records")
                     else:
                         print("❌ Bảng gốc cũng trống!")
                 except Exception as e2:
@@ -607,11 +728,18 @@ def clean_all_dimensions_incremental(spark: SparkSession, merge_types: bool = Fa
                 pass
     
     # (Tuỳ chọn) gộp TYPE tương đồng
+    # QUAN TRỌNG: Dùng hàm riêng trong file streaming (KHÔNG import từ batch)
+    # - Đọc từ: GOLD_TYPE_DIMENSION_CLEAN
+    # - CHỈ tạo mapping, KHÔNG ghi đè bảng CLEAN
+    # - KHÔNG động vào bảng gốc GOLD_TYPE_DIMENSION
     type_mapping = {}
     if merge_types:
         print("\n🔗 Bước 3: Merge duplicate types...")
+        print("   📝 Chỉ xử lý bảng CLEAN, không động vào bảng gốc")
+        print("   📝 CHỈ tạo mapping, KHÔNG ghi đè bảng CLEAN (giống logic cũ)")
         try:
-            type_mapping = merge_duplicate_types_and_update_fact(spark)
+            # Dùng hàm riêng trong file streaming (không import từ batch)
+            type_mapping = merge_duplicate_types_and_update_fact_streaming(spark)
             print(f"✅ Type mapping: {len(type_mapping)} mappings")
         except Exception as e:
             print(f"❌ Lỗi khi merge duplicate types: {e}")
