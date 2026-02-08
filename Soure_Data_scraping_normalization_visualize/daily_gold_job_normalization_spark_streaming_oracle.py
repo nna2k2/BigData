@@ -451,24 +451,21 @@ def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "append"
                     
                     if existing_count > 0:
                         print(f"   📊 Bảng hiện có {existing_count} records")
-                        # Tạo DataFrame rỗng với schema đúng từ dữ liệu mới
-                        # Ghi DataFrame rỗng để xóa dữ liệu cũ
-                        empty_df = df.limit(0)  # DataFrame rỗng với schema đúng
+                        # ⚠️ QUAN TRỌNG: Không nên ghi DataFrame rỗng vì có thể drop bảng
+                        # Thay vào đó, dùng OVERWRITE trực tiếp với schema đúng
+                        # Đảm bảo schema của df khớp với schema trong DB
+                        print(f"   🔄 Schema trong DB: {existing_df.columns}")
+                        print(f"   🔄 Schema của DataFrame mới: {df.columns}")
                         
-                        # Ghi DataFrame rỗng để xóa dữ liệu cũ (an toàn hơn OVERWRITE)
-                        print(f"   🔄 Xóa dữ liệu cũ bằng cách ghi DataFrame rỗng...")
-                        empty_df.write \
-                            .format("jdbc") \
-                            .option("url", f"jdbc:oracle:thin:{DB_USER}/{DB_PASS}@{DB_DSN}") \
-                            .option("dbtable", table_name) \
-                            .option("driver", "oracle.jdbc.driver.OracleDriver") \
-                            .mode("overwrite") \
-                            .save()
-                        print(f"   ✅ Đã xóa dữ liệu cũ")
-                        
-                        # Sau đó append dữ liệu mới
-                        mode = "append"
-                        print(f"   ✅ Sẽ dùng APPEND mode để ghi dữ liệu mới")
+                        # Kiểm tra schema có khớp không
+                        if set(existing_df.columns) == set(df.columns):
+                            print(f"   ✅ Schema khớp, sẽ dùng OVERWRITE trực tiếp")
+                            # Không đổi mode, dùng OVERWRITE trực tiếp
+                        else:
+                            print(f"   ⚠️ Schema không khớp, có thể gây mất dữ liệu")
+                            print(f"   📊 Khôi phục dữ liệu cũ...")
+                            # Không ghi, giữ nguyên dữ liệu cũ
+                            return
                     else:
                         print(f"   📊 Bảng hiện trống, sẽ ghi dữ liệu mới")
                         mode = "append"  # Append vào bảng trống an toàn hơn
@@ -477,8 +474,10 @@ def write_table_to_oracle(df: 'DataFrame', table_name: str, mode: str = "append"
                     print(f"   ⚠️ CẢNH BÁO: Sẽ dùng OVERWRITE (có thể rủi ro mất dữ liệu)")
                     print(f"   💡 Khuyến nghị: Cài jaydebeapi để tránh dùng OVERWRITE")
         else:
-            print(f"   ⚠️ Không có SparkSession, không thể xóa dữ liệu cũ")
-            print(f"   ⚠️ CẢNH BÁO: Sẽ dùng OVERWRITE (có thể rủi ro mất dữ liệu)")
+            # Nếu không có spark, dùng OVERWRITE trực tiếp (giống GOLD_PRICE_FACT_CLEAN)
+            # GOLD_PRICE_FACT_CLEAN hoạt động bình thường với OVERWRITE không có spark
+            print(f"   ⚠️ Không có SparkSession, dùng OVERWRITE trực tiếp (giống GOLD_PRICE_FACT_CLEAN)")
+            print(f"   📝 Đảm bảo schema khớp với DB để tránh mất dữ liệu")
     
     try:
         df.write \
@@ -904,12 +903,13 @@ def merge_duplicate_types_and_update_fact_streaming(spark: SparkSession) -> Dict
             except Exception as e:
                 print(f"         ⚠️ Không thể lấy sample: {e}")
             
-            # ⚠️ THỬ NGHIỆM: Không truyền spark parameter để dùng logic giống GOLD_PRICE_FACT_CLEAN
-            # GOLD_PRICE_FACT_CLEAN hoạt động bình thường với overwrite không có spark parameter
-            print(f"   🔄 Dùng OVERWRITE trực tiếp (giống GOLD_PRICE_FACT_CLEAN)...")
+            # ⚠️ QUAN TRỌNG: Truyền spark parameter để có thể xử lý OVERWRITE an toàn
+            # Nếu không có spark, sẽ dùng OVERWRITE trực tiếp (có thể rủi ro)
+            print(f"   🔄 Ghi dữ liệu với OVERWRITE mode...")
             
             try:
-                write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite")
+                # Truyền spark để có thể xử lý OVERWRITE an toàn (nếu có thể)
+                write_table_to_oracle(df_clean_merged, f"{DB_USER}.GOLD_TYPE_DIMENSION_CLEAN", "overwrite", spark)
                 
                 # ⚠️ QUAN TRỌNG: Verify sau khi ghi - đọc lại để kiểm tra
                 spark.catalog.clearCache()
